@@ -50,12 +50,11 @@ async function handleEvent(event) {
 
   try {
     // 1) ดึงรูปจาก LINE
-    const imageData = await getLineImage(messageId);
-    const base64Image = imageData.buffer.toString('base64');
-    const mediaType = imageData.contentType.split(';')[0] || 'image/jpeg';
+    const imageBuffer = await getLineImage(messageId);
+    const base64Image = imageBuffer.toString('base64');
 
     // 2) ให้ Claude อ่านสลิป
-    const slipData = await analyzeSlipWithClaude(base64Image, mediaType);
+    const slipData = await analyzeSlipWithClaude(base64Image);
     console.log('✦ Claude อ่านสลิป:', slipData);
 
     if (!slipData || !slipData.amount) {
@@ -86,7 +85,6 @@ async function handleEvent(event) {
 
 // ── ดึงรูปจาก LINE ────────────────────────────────────────────
 async function getLineImage(messageId) {
-  console.log(`🔑 Using token: ${LINE_TOKEN ? LINE_TOKEN.substring(0,20)+'...' : 'MISSING'}`);
   const res = await axios.get(
     `https://api-data.line.me/v2/bot/message/${messageId}/content`,
     {
@@ -94,12 +92,11 @@ async function getLineImage(messageId) {
       responseType: 'arraybuffer'
     }
   );
-  console.log(`📦 Image content-type: ${res.headers['content-type']}`);
-  return { buffer: Buffer.from(res.data), contentType: res.headers['content-type'] || 'image/jpeg' };
+  return Buffer.from(res.data);
 }
 
 // ── Claude อ่านสลิป ────────────────────────────────────────────
-async function analyzeSlipWithClaude(base64Image, mediaType = 'image/jpeg') {
+async function analyzeSlipWithClaude(base64Image) {
   const prompt = `คุณเป็น AI ผู้เชี่ยวชาญอ่านสลิปโอนเงินธนาคารไทย
 วิเคราะห์สลิปนี้แล้วตอบเป็น JSON เท่านั้น ไม่มีข้อความอื่น ไม่มี markdown:
 {
