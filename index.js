@@ -9,7 +9,7 @@ app.use(express.json({
   verify: (req, _res, buf) => { req.rawBody = buf; }
 }));
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 const LINE_SECRET  = process.env.LINE_CHANNEL_SECRET;
 const LINE_TOKEN   = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
