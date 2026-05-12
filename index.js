@@ -9,10 +9,7 @@ app.use(express.json({
   verify: (req, _res, buf) => { req.rawBody = buf; }
 }));
 
-const port = process.env.PORT || 10000;
-app.listen(port, '0.0.0.0', () => {
-  console.log(`Server is running on port ${port}`);
-});
+const PORT = process.env.PORT || 3000;
 const LINE_SECRET  = process.env.LINE_CHANNEL_SECRET;
 const LINE_TOKEN   = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
@@ -53,11 +50,12 @@ async function handleEvent(event) {
 
   try {
     // 1) ดึงรูปจาก LINE
-    const imageBuffer = await getLineImage(messageId);
-    const base64Image = imageBuffer.toString('base64');
+    const imageData = await getLineImage(messageId);
+    const base64Image = imageData.buffer.toString('base64');
+    const mediaType = imageData.contentType.split(';')[0] || 'image/jpeg';
 
     // 2) ให้ Claude อ่านสลิป
-    const slipData = await analyzeSlipWithClaude(base64Image);
+    const slipData = await analyzeSlipWithClaude(base64Image, mediaType);
     console.log('✦ Claude อ่านสลิป:', slipData);
 
     if (!slipData || !slipData.amount) {
@@ -88,6 +86,7 @@ async function handleEvent(event) {
 
 // ── ดึงรูปจาก LINE ────────────────────────────────────────────
 async function getLineImage(messageId) {
+  console.log(`🔑 Using token: ${LINE_TOKEN ? LINE_TOKEN.substring(0,20)+'...' : 'MISSING'}`);
   const res = await axios.get(
     `https://api-data.line.me/v2/bot/message/${messageId}/content`,
     {
@@ -95,11 +94,12 @@ async function getLineImage(messageId) {
       responseType: 'arraybuffer'
     }
   );
-  return Buffer.from(res.data);
+  console.log(`📦 Image content-type: ${res.headers['content-type']}`);
+  return { buffer: Buffer.from(res.data), contentType: res.headers['content-type'] || 'image/jpeg' };
 }
 
 // ── Claude อ่านสลิป ────────────────────────────────────────────
-async function analyzeSlipWithClaude(base64Image) {
+async function analyzeSlipWithClaude(base64Image, mediaType = 'image/jpeg') {
   const prompt = `คุณเป็น AI ผู้เชี่ยวชาญอ่านสลิปโอนเงินธนาคารไทย
 วิเคราะห์สลิปนี้แล้วตอบเป็น JSON เท่านั้น ไม่มีข้อความอื่น ไม่มี markdown:
 {
