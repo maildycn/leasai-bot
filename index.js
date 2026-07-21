@@ -63,7 +63,7 @@ async function handleEvent(event) {
     const slip = JSON.parse(raw);
     console.log('Slip:', slip);
 
-    if (!slip.is_slip) return reply(replyToken, 'รูปนี้ไม่ใช่สลิปโอนเงินครับ');
+    if (!slip.is_slip) { console.log('ไม่ใช่สลิป — ไม่ตอบกลับ'); return; }
 
     const nRes = await axios.post(
       `https://api.notion.com/v1/databases/${NOTION_ASSET_DB}/query`,
