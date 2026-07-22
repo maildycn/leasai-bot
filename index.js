@@ -18,6 +18,21 @@ const NOTION_ASSET_DB  = process.env.NOTION_ASSET_DB_ID;
 
 app.get('/', (_req, res) => res.send('LeaseAI Bot OK'));
 
+// เผื่อ AI อ่านปีจากสลิปผิด (พ.ศ./ค.ศ. สลับกัน) — ตรวจสอบและแก้ปีให้ถูกต้องอีกชั้นก่อนบันทึก Notion
+function normalizeSlipDate(dateStr) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(dateStr || '');
+  if (!m) return null;
+  let y = +m[1];
+  const [, , mo, d] = m;
+  const nowY = new Date().getFullYear();
+  if (y > 2400) y -= 543; // พ.ศ. เต็ม (25xx) -> ค.ศ.
+  if (y < nowY - 3 || y > nowY + 3) {
+    const guess = 2500 + (y % 100) - 543; // ปีเพี้ยน เดาจาก 2 หลักท้ายแบบ พ.ศ.
+    if (guess >= nowY - 3 && guess <= nowY + 3) y = guess;
+  }
+  return `${y}-${mo}-${d}`;
+}
+
 app.post('/webhook', (req, res) => {
   const sig  = req.headers['x-line-signature'];
   const hash = crypto.createHmac('sha256', LINE_SECRET)
@@ -52,7 +67,7 @@ async function handleEvent(event) {
           role: 'user',
           content: [
             { type: 'image', source: { type: 'base64', media_type: mime, data: b64 } },
-            { type: 'text', text: 'อ่านสลิปโอนเงินธนาคารไทยนี้แล้วตอบ JSON เท่านั้น ห้ามมี markdown: {"sender_name":string_or_null,"amount":number_or_null,"date":"YYYY-MM-DD"_or_null,"time":string_or_null,"ref_number":string_or_null,"bank_from":string_or_null,"bank_to":string_or_null,"is_slip":boolean}' }
+            { type: 'text', text: 'อ่านสลิปโอนเงินธนาคารไทยนี้แล้วตอบ JSON เท่านั้น ห้ามมี markdown: {"sender_name":string_or_null,"amount":number_or_null,"date":"YYYY-MM-DD"_or_null,"time":string_or_null,"ref_number":string_or_null,"bank_from":string_or_null,"bank_to":string_or_null,"is_slip":boolean}\n\nสำคัญมาก: ฟิลด์ date ต้องเป็นปีคริสต์ศักราช (ค.ศ.) เสมอ ถ้าวันที่ในสลิปแสดงเป็นปีพุทธศักราช (พ.ศ., ปกติจะเป็นเลข 25xx เช่น 2569) ให้แปลงเป็น ค.ศ. โดยลบ 543 ก่อนตอบ (เช่น พ.ศ. 2569 → ค.ศ. 2026) ห้ามตอบเลขปีพ.ศ.ตรงๆ โดยเด็ดขาด' }
           ]
         }]
       },
@@ -64,6 +79,10 @@ async function handleEvent(event) {
     console.log('Slip:', slip);
 
     if (!slip.is_slip) { console.log('ไม่ใช่สลิป — ไม่ตอบกลับ'); return; }
+
+    const fixedDate = normalizeSlipDate(slip.date);
+    if (fixedDate && fixedDate !== slip.date) console.log('Date corrected:', slip.date, '->', fixedDate);
+    slip.date = fixedDate;
 
     const nRes = await axios.post(
       `https://api.notion.com/v1/databases/${NOTION_ASSET_DB}/query`,
@@ -90,7 +109,10 @@ async function handleEvent(event) {
         'หมายเหตุ': { rich_text: [{ text: { content: `ผู้โอน: ${slip.sender_name||'-'} | อ้างอิง: ${slip.ref_number||'-'}` } }] }
       }
     };
-    if (slip.date) body.properties['วันที่'] = { date: { start: slip.date } };
+    if (slip.date) {
+      body.properties['วันที่'] = { date: { start: slip.date } };
+      body.properties['รอบเดือน'] = { select: { name: slip.date.slice(0, 7) } };
+    }
     if (matched)   body.properties['ห้อง / ทรัพย์สิน'] = { rich_text: [{ text: { content: matched.name } }] };
 
     await axios.post('https://api.notion.com/v1/pages', body,
