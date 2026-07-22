@@ -24,7 +24,13 @@ Set these in the Render service's Environment settings:
 
 ## Daily rent-due reminders
 
-`GET /cron/check-rent?key=<CRON_SECRET>` checks every active contract with a `วันครบชำระ` (due day) set in the Contract DB, and if today's day-of-month is on or past the due day with no matching payment recorded in "💰 รายรับ-รายจ่าย" for the current month (`รอบเดือน`), it pushes a summary to `LINE_GROUP_ID`. Render's free web-service tier has no built-in cron, so point an external free scheduler (e.g. cron-job.org) at that URL once a day.
+`GET /cron/check-rent?key=<CRON_SECRET>` checks every active contract with a `วันครบชำระ` (due day) set in the Contract DB, and if today's day-of-month is on or past the due day with no matching payment recorded in "💰 รายรับ-รายจ่าย" for the current month (`รอบเดือน`), it's overdue. Render's free web-service tier has no built-in cron, so point an external free scheduler (e.g. cron-job.org) at that URL once a day.
+
+Per contract, two more fields control where the reminder goes:
+- `LINE Group ID` — if set, a personalized reminder is pushed directly to that tenant's own group instead of the main one. Get a group's ID by typing `กลุ่มไอดี` in it.
+- `ใช้บอทขุนทองอยู่แล้ว` (checkbox) — if checked, that room is skipped entirely (no duplicate nagging when another bot already handles it).
+
+Contracts with neither set fall back to a single summary message pushed to `LINE_GROUP_ID` (the main/owner group), so nothing goes unnoticed while per-tenant groups are being configured one at a time.
 
 ## Related services (separate repos/hosts, not this one)
 
