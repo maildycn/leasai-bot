@@ -18,6 +18,7 @@ Set these in the Render service's Environment settings:
 - `NOTION_TOKEN`
 - `NOTION_INCOME_DB_ID` — the "💰 รายรับ-รายจ่าย" database
 - `NOTION_ASSET_DB_ID` — the "AssetLiving" database (used to match slip amounts to rooms)
+- `NOTION_CONTRACT_DB_ID` — the "LeaseAI — สัญญาเช่า" database (`0d3ce732aec048f298c93baa788b5306`). Optional but strongly recommended: without it, room matching falls back to comparing the slip amount against AssetLiving's listed rent, which is often stale/wrong and ambiguous when rooms share the same listed price. With it, matching uses the tenant's name first (much more reliable) and the real contract rent as fallback.
 
 ## Related services (separate repos/hosts, not this one)
 
