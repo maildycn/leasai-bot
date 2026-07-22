@@ -105,10 +105,21 @@ async function fetchAssetsWithContracts() {
   }).filter(a => a.rent > 0);
 }
 
-// เช็คค่าเช่าค้างชำระวันนี้ แล้วส่งแจ้งเตือนเข้ากลุ่ม LINE
+// เช็คค่าเช่าค้างชำระวันนี้ แล้วส่งแจ้งเตือนเข้ากลุ่ม LINE — คืนค่าสรุปผลกลับไปด้วยเพื่อใช้ debug ผ่าน HTTP response โดยตรง ไม่ต้องพึ่ง server log
 async function checkRentDue() {
+  const summary = {
+    lineGroupIdConfigured: !!LINE_GROUP_ID,
+    assetsWithDueDay: 0,
+    overdueRooms: [],
+    directSent: [],
+    directFailed: [],
+    fallbackSent: false,
+    fallbackSkippedReason: null,
+  };
+
   const assets = (await fetchAssetsWithContracts()).filter(a => a.dueDay);
-  if (!assets.length) { console.log('No contracts with a due day set.'); return; }
+  summary.assetsWithDueDay = assets.length;
+  if (!assets.length) return summary;
 
   const today = new Date();
   const day = today.getDate();
@@ -125,7 +136,8 @@ async function checkRentDue() {
 
   // ห้องที่ติ๊ก "ใช้บอทขุนทองอยู่แล้ว" ข้ามไปเลย กันแจ้งซ้ำซ้อนกับอีกบอท
   const overdue = assets.filter(a => day >= a.dueDay && !paidRooms.has(a.name) && !a.skipReminder);
-  if (!overdue.length) { console.log('No overdue rents today.'); return; }
+  summary.overdueRooms = overdue.map(a => a.name);
+  if (!overdue.length) return summary;
 
   // ห้องที่มี LINE Group ID ของตัวเอง -> ทวงตรงเข้ากลุ่มผู้เช่าคนนั้นเลย
   // ห้องที่ยังไม่ได้ตั้ง Group ID ไว้ -> รวมเป็นสรุปเดียวส่งเข้ากลุ่มหลัก กันตกหล่น
@@ -134,35 +146,50 @@ async function checkRentDue() {
 
   for (const a of direct) {
     const msg = `🔔 แจ้งเตือนค่าเช่าค้างชำระ\n━━━━━━━━━━━━━━\n🏠 ห้อง: ${a.name}\n💰 ค่าเช่า: ฿${a.rent.toLocaleString()}\n📅 ครบกำหนดชำระทุกวันที่ ${a.dueDay}\n\nรบกวนโอนค่าเช่าและส่งสลิปเข้ากลุ่มนี้ได้เลยครับ ขอบคุณครับ 🙏`;
-    await axios.post('https://api.line.me/v2/bot/message/push',
-      { to: a.tenantGroupId, messages: [{ type: 'text', text: msg }] },
-      { headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' } }
-    ).catch(err => console.error('Push failed for', a.name, err.response?.data || err.message));
+    try {
+      await axios.post('https://api.line.me/v2/bot/message/push',
+        { to: a.tenantGroupId, messages: [{ type: 'text', text: msg }] },
+        { headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' } }
+      );
+      summary.directSent.push(a.name);
+    } catch (err) {
+      summary.directFailed.push({ name: a.name, error: err.response?.data || err.message });
+    }
   }
-  console.log('Direct reminders sent:', direct.length, 'rooms');
 
-  if (fallback.length && LINE_GROUP_ID) {
+  if (!fallback.length) {
+    // nothing to do
+  } else if (!LINE_GROUP_ID) {
+    summary.fallbackSkippedReason = 'LINE_GROUP_ID env var is not set (empty/undefined)';
+    summary.fallbackRooms = fallback.map(a => a.name);
+  } else {
     const lines = fallback.map(a => `• ${a.name} — ${a.tenant || 'ไม่ระบุผู้เช่า'} (ครบกำหนดวันที่ ${a.dueDay}, ค่าเช่า ฿${a.rent.toLocaleString()})`);
     const msg = `🔔 แจ้งเตือนค่าเช่าค้างชำระ (ยังไม่ได้ตั้งกลุ่มผู้เช่า) (${today.toLocaleDateString('th-TH')})\n━━━━━━━━━━━━━━\n${lines.join('\n')}`;
-    await axios.post('https://api.line.me/v2/bot/message/push',
-      { to: LINE_GROUP_ID, messages: [{ type: 'text', text: msg }] },
-      { headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' } }
-    );
-    console.log('Fallback notice sent to main group:', fallback.length, 'rooms');
-  } else if (fallback.length) {
-    console.log('LINE_GROUP_ID not set — would have sent fallback for:', fallback.map(a => a.name).join(', '));
+    try {
+      await axios.post('https://api.line.me/v2/bot/message/push',
+        { to: LINE_GROUP_ID, messages: [{ type: 'text', text: msg }] },
+        { headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' } }
+      );
+      summary.fallbackSent = true;
+      summary.fallbackRooms = fallback.map(a => a.name);
+    } catch (err) {
+      summary.fallbackSkippedReason = 'push failed: ' + JSON.stringify(err.response?.data || err.message);
+      summary.fallbackRooms = fallback.map(a => a.name);
+    }
   }
+
+  return summary;
 }
 
-// endpoint ให้ external cron (เช่น cron-job.org) เรียกทุกวันเพื่อเช็คค่าเช่าค้าง
+// endpoint ให้ external cron (เช่น cron-job.org) เรียกทุกวันเพื่อเช็คค่าเช่าค้าง — คืน JSON สรุปผลให้ debug ได้ทันทีจาก response
 app.get('/cron/check-rent', async (req, res) => {
   if (!CRON_SECRET || req.query.key !== CRON_SECRET) return res.status(403).send('Forbidden');
   try {
-    await checkRentDue();
-    res.send('OK');
+    const summary = await checkRentDue();
+    res.json(summary);
   } catch (err) {
-    console.error('Cron error:', err.message);
-    res.status(500).send('Error: ' + err.message);
+    console.error('Cron error:', err.response?.data || err.message);
+    res.status(500).json({ error: err.response?.data || err.message });
   }
 });
 
