@@ -85,6 +85,8 @@ async function fetchAssetsWithContracts() {
         rent: p.properties['ค่าเช่า (บาท/เดือน)']?.number || 0,
         status: p.properties['สถานะสัญญา']?.select?.name || '',
         dueDay: p.properties['วันครบชำระ']?.number || null,
+        tenantGroupId: p.properties['LINE Group ID']?.rich_text?.[0]?.plain_text || '',
+        skipReminder: p.properties['ใช้บอทขุนทองอยู่แล้ว']?.checkbox === true,
       }))
       .filter(c => c.room && c.rent && c.status !== 'ยกเลิก' && c.status !== 'หมดอายุแล้ว');
   }
@@ -92,7 +94,14 @@ async function fetchAssetsWithContracts() {
   // ราคาที่ AssetLiving เก็บไว้ให้เอเจนต์ดูอาจไม่ตรงค่าเช่าจริง — ใช้ราคาจากสัญญาจริงแทนถ้าจับคู่ห้องได้
   return assetPages.map(a => {
     const c = findContractForRoom(a.name, contracts);
-    return { name: a.name, rent: c ? c.rent : a.rent, tenant: c ? c.tenant : '', dueDay: c ? c.dueDay : null };
+    return {
+      name: a.name,
+      rent: c ? c.rent : a.rent,
+      tenant: c ? c.tenant : '',
+      dueDay: c ? c.dueDay : null,
+      tenantGroupId: c ? c.tenantGroupId : '',
+      skipReminder: c ? c.skipReminder : false,
+    };
   }).filter(a => a.rent > 0);
 }
 
@@ -114,20 +123,34 @@ async function checkRentDue() {
     iRes.data.results.map(p => p.properties['ห้อง / ทรัพย์สิน']?.rich_text?.[0]?.plain_text).filter(Boolean)
   );
 
-  const overdue = assets.filter(a => day >= a.dueDay && !paidRooms.has(a.name));
+  // ห้องที่ติ๊ก "ใช้บอทขุนทองอยู่แล้ว" ข้ามไปเลย กันแจ้งซ้ำซ้อนกับอีกบอท
+  const overdue = assets.filter(a => day >= a.dueDay && !paidRooms.has(a.name) && !a.skipReminder);
   if (!overdue.length) { console.log('No overdue rents today.'); return; }
 
-  const lines = overdue.map(a => `• ${a.name} — ${a.tenant || 'ไม่ระบุผู้เช่า'} (ครบกำหนดวันที่ ${a.dueDay}, ค่าเช่า ฿${a.rent.toLocaleString()})`);
-  const msg = `🔔 แจ้งเตือนค่าเช่าค้างชำระ (${today.toLocaleDateString('th-TH')})\n━━━━━━━━━━━━━━\n${lines.join('\n')}`;
+  // ห้องที่มี LINE Group ID ของตัวเอง -> ทวงตรงเข้ากลุ่มผู้เช่าคนนั้นเลย
+  // ห้องที่ยังไม่ได้ตั้ง Group ID ไว้ -> รวมเป็นสรุปเดียวส่งเข้ากลุ่มหลัก กันตกหล่น
+  const direct = overdue.filter(a => a.tenantGroupId);
+  const fallback = overdue.filter(a => !a.tenantGroupId);
 
-  if (LINE_GROUP_ID) {
+  for (const a of direct) {
+    const msg = `🔔 แจ้งเตือนค่าเช่าค้างชำระ\n━━━━━━━━━━━━━━\n🏠 ห้อง: ${a.name}\n💰 ค่าเช่า: ฿${a.rent.toLocaleString()}\n📅 ครบกำหนดชำระทุกวันที่ ${a.dueDay}\n\nรบกวนโอนค่าเช่าและส่งสลิปเข้ากลุ่มนี้ได้เลยครับ ขอบคุณครับ 🙏`;
+    await axios.post('https://api.line.me/v2/bot/message/push',
+      { to: a.tenantGroupId, messages: [{ type: 'text', text: msg }] },
+      { headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' } }
+    ).catch(err => console.error('Push failed for', a.name, err.response?.data || err.message));
+  }
+  console.log('Direct reminders sent:', direct.length, 'rooms');
+
+  if (fallback.length && LINE_GROUP_ID) {
+    const lines = fallback.map(a => `• ${a.name} — ${a.tenant || 'ไม่ระบุผู้เช่า'} (ครบกำหนดวันที่ ${a.dueDay}, ค่าเช่า ฿${a.rent.toLocaleString()})`);
+    const msg = `🔔 แจ้งเตือนค่าเช่าค้างชำระ (ยังไม่ได้ตั้งกลุ่มผู้เช่า) (${today.toLocaleDateString('th-TH')})\n━━━━━━━━━━━━━━\n${lines.join('\n')}`;
     await axios.post('https://api.line.me/v2/bot/message/push',
       { to: LINE_GROUP_ID, messages: [{ type: 'text', text: msg }] },
       { headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' } }
     );
-    console.log('Overdue notice sent to group:', overdue.length, 'rooms');
-  } else {
-    console.log('LINE_GROUP_ID not set — would have sent:', msg);
+    console.log('Fallback notice sent to main group:', fallback.length, 'rooms');
+  } else if (fallback.length) {
+    console.log('LINE_GROUP_ID not set — would have sent fallback for:', fallback.map(a => a.name).join(', '));
   }
 }
 
