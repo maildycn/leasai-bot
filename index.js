@@ -16,6 +16,8 @@ const NOTION_TOKEN  = process.env.NOTION_TOKEN;
 const NOTION_INCOME_DB    = process.env.NOTION_INCOME_DB_ID;
 const NOTION_ASSET_DB     = process.env.NOTION_ASSET_DB_ID;
 const NOTION_CONTRACT_DB  = process.env.NOTION_CONTRACT_DB_ID;
+const LINE_GROUP_ID       = process.env.LINE_GROUP_ID;
+const CRON_SECRET         = process.env.CRON_SECRET;
 
 app.get('/', (_req, res) => res.send('LeaseAI Bot OK'));
 
@@ -58,6 +60,89 @@ function findContractForRoom(assetName, contracts) {
   return cands[0] || null;
 }
 
+// รวมห้องจาก AssetLiving กับสัญญาจริง (Contract DB) เป็นรายการเดียว — ใช้ทั้งตอนจับคู่สลิปและตอนเช็คค่าเช่าค้าง
+async function fetchAssetsWithContracts() {
+  const nRes = await axios.post(
+    `https://api.notion.com/v1/databases/${NOTION_ASSET_DB}/query`,
+    { page_size: 100 },
+    { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
+  );
+  const assetPages = nRes.data.results
+    .map(p => ({ name: p.properties['ชื่อทรัพย์สิน']?.title?.[0]?.plain_text || '', rent: p.properties['ค่าเช่ารายเดือน']?.number || 0 }))
+    .filter(a => a.name);
+
+  let contracts = [];
+  if (NOTION_CONTRACT_DB) {
+    const cRes = await axios.post(
+      `https://api.notion.com/v1/databases/${NOTION_CONTRACT_DB}/query`,
+      { page_size: 100 },
+      { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
+    );
+    contracts = cRes.data.results
+      .map(p => ({
+        tenant: p.properties['ชื่อผู้เช่า']?.title?.[0]?.plain_text || '',
+        room: p.properties['ทรัพย์สิน / ห้อง']?.rich_text?.[0]?.plain_text || '',
+        rent: p.properties['ค่าเช่า (บาท/เดือน)']?.number || 0,
+        status: p.properties['สถานะสัญญา']?.select?.name || '',
+        dueDay: p.properties['วันครบชำระ']?.number || null,
+      }))
+      .filter(c => c.room && c.rent && c.status !== 'ยกเลิก' && c.status !== 'หมดอายุแล้ว');
+  }
+
+  // ราคาที่ AssetLiving เก็บไว้ให้เอเจนต์ดูอาจไม่ตรงค่าเช่าจริง — ใช้ราคาจากสัญญาจริงแทนถ้าจับคู่ห้องได้
+  return assetPages.map(a => {
+    const c = findContractForRoom(a.name, contracts);
+    return { name: a.name, rent: c ? c.rent : a.rent, tenant: c ? c.tenant : '', dueDay: c ? c.dueDay : null };
+  }).filter(a => a.rent > 0);
+}
+
+// เช็คค่าเช่าค้างชำระวันนี้ แล้วส่งแจ้งเตือนเข้ากลุ่ม LINE
+async function checkRentDue() {
+  const assets = (await fetchAssetsWithContracts()).filter(a => a.dueDay);
+  if (!assets.length) { console.log('No contracts with a due day set.'); return; }
+
+  const today = new Date();
+  const day = today.getDate();
+  const monthKey = today.toISOString().slice(0, 7); // YYYY-MM
+
+  const iRes = await axios.post(
+    `https://api.notion.com/v1/databases/${NOTION_INCOME_DB}/query`,
+    { page_size: 100, filter: { property: 'รอบเดือน', select: { equals: monthKey } } },
+    { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
+  );
+  const paidRooms = new Set(
+    iRes.data.results.map(p => p.properties['ห้อง / ทรัพย์สิน']?.rich_text?.[0]?.plain_text).filter(Boolean)
+  );
+
+  const overdue = assets.filter(a => day >= a.dueDay && !paidRooms.has(a.name));
+  if (!overdue.length) { console.log('No overdue rents today.'); return; }
+
+  const lines = overdue.map(a => `• ${a.name} — ${a.tenant || 'ไม่ระบุผู้เช่า'} (ครบกำหนดวันที่ ${a.dueDay}, ค่าเช่า ฿${a.rent.toLocaleString()})`);
+  const msg = `🔔 แจ้งเตือนค่าเช่าค้างชำระ (${today.toLocaleDateString('th-TH')})\n━━━━━━━━━━━━━━\n${lines.join('\n')}`;
+
+  if (LINE_GROUP_ID) {
+    await axios.post('https://api.line.me/v2/bot/message/push',
+      { to: LINE_GROUP_ID, messages: [{ type: 'text', text: msg }] },
+      { headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' } }
+    );
+    console.log('Overdue notice sent to group:', overdue.length, 'rooms');
+  } else {
+    console.log('LINE_GROUP_ID not set — would have sent:', msg);
+  }
+}
+
+// endpoint ให้ external cron (เช่น cron-job.org) เรียกทุกวันเพื่อเช็คค่าเช่าค้าง
+app.get('/cron/check-rent', async (req, res) => {
+  if (!CRON_SECRET || req.query.key !== CRON_SECRET) return res.status(403).send('Forbidden');
+  try {
+    await checkRentDue();
+    res.send('OK');
+  } catch (err) {
+    console.error('Cron error:', err.message);
+    res.status(500).send('Error: ' + err.message);
+  }
+});
+
 app.post('/webhook', (req, res) => {
   const sig  = req.headers['x-line-signature'];
   const hash = crypto.createHmac('sha256', LINE_SECRET)
@@ -68,6 +153,13 @@ app.post('/webhook', (req, res) => {
 });
 
 async function handleEvent(event) {
+  // พิมพ์ "กลุ่มไอดี" ในแชท เพื่อดึง ID ของกลุ่ม/ห้อง/ผู้ใช้ — เอาไปตั้งเป็น env var LINE_GROUP_ID สำหรับส่งแจ้งเตือนค่าเช่าค้าง
+  if (event.type === 'message' && event.message.type === 'text' && event.message.text.trim() === 'กลุ่มไอดี') {
+    const src = event.source;
+    const id = src.groupId || src.roomId || src.userId || 'ไม่พบ';
+    await reply(event.replyToken, `ID: ${id}`);
+    return;
+  }
   if (event.type !== 'message' || event.message.type !== 'image') return;
   const msgId      = event.message.id;
   const replyToken = event.replyToken;
@@ -115,37 +207,7 @@ async function handleEvent(event) {
     if (fixedDate && fixedDate !== slip.date) console.log('Date corrected:', slip.date, '->', fixedDate);
     slip.date = fixedDate;
 
-    const nRes = await axios.post(
-      `https://api.notion.com/v1/databases/${NOTION_ASSET_DB}/query`,
-      { page_size: 100 },
-      { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
-    );
-    const assetPages = nRes.data.results
-      .map(p => ({ name: p.properties['ชื่อทรัพย์สิน']?.title?.[0]?.plain_text || '', rent: p.properties['ค่าเช่ารายเดือน']?.number || 0 }))
-      .filter(a => a.name);
-
-    let contracts = [];
-    if (NOTION_CONTRACT_DB) {
-      const cRes = await axios.post(
-        `https://api.notion.com/v1/databases/${NOTION_CONTRACT_DB}/query`,
-        { page_size: 100 },
-        { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
-      );
-      contracts = cRes.data.results
-        .map(p => ({
-          tenant: p.properties['ชื่อผู้เช่า']?.title?.[0]?.plain_text || '',
-          room: p.properties['ทรัพย์สิน / ห้อง']?.rich_text?.[0]?.plain_text || '',
-          rent: p.properties['ค่าเช่า (บาท/เดือน)']?.number || 0,
-          status: p.properties['สถานะสัญญา']?.select?.name || '',
-        }))
-        .filter(c => c.room && c.rent && c.status !== 'ยกเลิก' && c.status !== 'หมดอายุแล้ว');
-    }
-
-    // ราคาที่ AssetLiving เก็บไว้ให้เอเจนต์ดูอาจไม่ตรงค่าเช่าจริง — ใช้ราคาจากสัญญาจริงแทนถ้าจับคู่ห้องได้
-    const assets = assetPages.map(a => {
-      const c = findContractForRoom(a.name, contracts);
-      return { name: a.name, rent: c ? c.rent : a.rent, tenant: c ? c.tenant : '' };
-    }).filter(a => a.rent > 0);
+    const assets = await fetchAssetsWithContracts();
 
     // จับคู่ห้อง เรียงตามความน่าเชื่อถือ: 1) โน้ตในสลิปที่ระบุห้องตรงๆ 2) ชื่อผู้เช่า 3) ยอดเงินตรงเป๊ะเท่านั้น
     // ไม่เดาจาก "ยอดใกล้เคียง" อีกต่อไป — เคยจับผิดห้องเวลาผู้เช่าหักค่าใช้จ่ายอื่นออกจากยอดโอนแล้วยอดไปใกล้ห้องอื่นโดยบังเอิญ
