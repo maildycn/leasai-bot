@@ -13,8 +13,9 @@ const LINE_SECRET   = process.env.LINE_CHANNEL_SECRET;
 const LINE_TOKEN    = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const NOTION_TOKEN  = process.env.NOTION_TOKEN;
-const NOTION_INCOME_DB = process.env.NOTION_INCOME_DB_ID;
-const NOTION_ASSET_DB  = process.env.NOTION_ASSET_DB_ID;
+const NOTION_INCOME_DB    = process.env.NOTION_INCOME_DB_ID;
+const NOTION_ASSET_DB     = process.env.NOTION_ASSET_DB_ID;
+const NOTION_CONTRACT_DB  = process.env.NOTION_CONTRACT_DB_ID;
 
 app.get('/', (_req, res) => res.send('LeaseAI Bot OK'));
 
@@ -31,6 +32,30 @@ function normalizeSlipDate(dateStr) {
     if (guess >= nowY - 3 && guess <= nowY + 3) y = guess;
   }
   return `${y}-${mo}-${d}`;
+}
+
+// จับคู่ห้อง — ราคาที่ AssetLiving เก็บไว้ใช้โชว์เอเจนต์ อาจไม่ตรงค่าเช่าจริง และหลายห้องราคาซ้ำกัน
+// จับคู่ตามสัญญาจริง (Contract DB) แทน โดยพยายามจับชื่อผู้เช่าก่อน แล้วค่อย fallback เป็นยอดเงิน
+function normRoomKey(s) {
+  return (s || '').toLowerCase().replace(/\s+/g, '').replace(/[\/\-_.,()（）]/g, '')
+    .replace(/ห้อง/g, '').replace(/ชั้น/g, '').replace(/อาคาร/g, '').replace(/ตึก/g, '').replace(/คอนโด/g, '')
+    .replace(/condominium|condo|room|floor|bldg|building/gi, '');
+}
+function roomNumTag(name) {
+  const m = /(\d{2,4}(?:\/\d{1,4})?)\s*$/.exec((name || '').trim());
+  return m ? m[1] : null;
+}
+function normName(s) {
+  return (s || '').replace(/\s+/g, '').replace(/^(นาย|นาง|นางสาว|น\.ส\.|คุณ|ร\.ต\.|ด\.ต\.|ดร\.)/, '').toLowerCase();
+}
+function findContractForRoom(assetName, contracts) {
+  const tag = roomNumTag(assetName);
+  let cands = tag ? contracts.filter(c => c.room.includes(tag)) : [];
+  if (!cands.length) {
+    const nk = normRoomKey(assetName);
+    if (nk) cands = contracts.filter(c => { const ck = normRoomKey(c.room); return ck && (ck.includes(nk) || nk.includes(ck)); });
+  }
+  return cands[0] || null;
 }
 
 app.post('/webhook', (req, res) => {
@@ -89,13 +114,44 @@ async function handleEvent(event) {
       { page_size: 100 },
       { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
     );
-    const assets = nRes.data.results
+    const assetPages = nRes.data.results
       .map(p => ({ name: p.properties['ชื่อทรัพย์สิน']?.title?.[0]?.plain_text || '', rent: p.properties['ค่าเช่ารายเดือน']?.number || 0 }))
-      .filter(a => a.name && a.rent > 0);
+      .filter(a => a.name);
 
-    const matched = assets.find(a => a.rent === slip.amount)
-      || assets.map(a => ({ ...a, diff: Math.abs(a.rent - (slip.amount||0)) })).filter(a => a.diff <= 500).sort((a,b) => a.diff-b.diff)[0]
-      || null;
+    let contracts = [];
+    if (NOTION_CONTRACT_DB) {
+      const cRes = await axios.post(
+        `https://api.notion.com/v1/databases/${NOTION_CONTRACT_DB}/query`,
+        { page_size: 100 },
+        { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
+      );
+      contracts = cRes.data.results
+        .map(p => ({
+          tenant: p.properties['ชื่อผู้เช่า']?.title?.[0]?.plain_text || '',
+          room: p.properties['ทรัพย์สิน / ห้อง']?.rich_text?.[0]?.plain_text || '',
+          rent: p.properties['ค่าเช่า (บาท/เดือน)']?.number || 0,
+          status: p.properties['สถานะสัญญา']?.select?.name || '',
+        }))
+        .filter(c => c.room && c.rent && c.status !== 'ยกเลิก' && c.status !== 'หมดอายุแล้ว');
+    }
+
+    // ราคาที่ AssetLiving เก็บไว้ให้เอเจนต์ดูอาจไม่ตรงค่าเช่าจริง — ใช้ราคาจากสัญญาจริงแทนถ้าจับคู่ห้องได้
+    const assets = assetPages.map(a => {
+      const c = findContractForRoom(a.name, contracts);
+      return { name: a.name, rent: c ? c.rent : a.rent, tenant: c ? c.tenant : '' };
+    }).filter(a => a.rent > 0);
+
+    // จับคู่ตามชื่อผู้เช่าก่อน (แม่นยำกว่า) แล้วค่อย fallback เป็นยอดเงิน — กันปัญหาหลายห้องราคาเท่ากัน
+    let matched = null;
+    if (slip.sender_name) {
+      const sn = normName(slip.sender_name);
+      if (sn) matched = assets.find(a => a.tenant && (normName(a.tenant).includes(sn) || sn.includes(normName(a.tenant))));
+    }
+    if (!matched) {
+      matched = assets.find(a => a.rent === slip.amount)
+        || assets.map(a => ({ ...a, diff: Math.abs(a.rent - (slip.amount||0)) })).filter(a => a.diff <= 500).sort((a,b) => a.diff-b.diff)[0]
+        || null;
+    }
 
     const title = matched ? `ค่าเช่า ${matched.name} ${slip.date||''}` : `โอนเงิน ${slip.amount||0}`;
     const body = {
