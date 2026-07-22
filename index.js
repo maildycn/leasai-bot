@@ -92,7 +92,13 @@ async function handleEvent(event) {
           role: 'user',
           content: [
             { type: 'image', source: { type: 'base64', media_type: mime, data: b64 } },
-            { type: 'text', text: 'อ่านสลิปโอนเงินธนาคารไทยนี้แล้วตอบ JSON เท่านั้น ห้ามมี markdown: {"sender_name":string_or_null,"amount":number_or_null,"date":"YYYY-MM-DD"_or_null,"time":string_or_null,"ref_number":string_or_null,"bank_from":string_or_null,"bank_to":string_or_null,"is_slip":boolean}\n\nสำคัญมาก: ฟิลด์ date ต้องเป็นปีคริสต์ศักราช (ค.ศ.) เสมอ ถ้าวันที่ในสลิปแสดงเป็นปีพุทธศักราช (พ.ศ., ปกติจะเป็นเลข 25xx เช่น 2569) ให้แปลงเป็น ค.ศ. โดยลบ 543 ก่อนตอบ (เช่น พ.ศ. 2569 → ค.ศ. 2026) ห้ามตอบเลขปีพ.ศ.ตรงๆ โดยเด็ดขาด' }
+            { type: 'text', text: `อ่านสลิปโอนเงินธนาคารไทยนี้ให้ละเอียดที่สุด อ่านข้อความทุกส่วนที่ปรากฏในภาพ รวมถึงข้อความบันทึกช่วยจำ/โน้ตที่ผู้โอนอาจพิมพ์แนบไว้ (ถ้ามี) แล้วตอบ JSON เท่านั้น ห้ามมี markdown:
+{"sender_name":string_or_null,"amount":number_or_null,"date":"YYYY-MM-DD"_or_null,"time":string_or_null,"ref_number":string_or_null,"bank_from":string_or_null,"bank_to":string_or_null,"memo":string_or_null,"is_slip":boolean}
+
+กติกาสำคัญ:
+1. memo คือข้อความบันทึกช่วยจำ/หมายเหตุที่ผู้โอนพิมพ์เอง (ถ้ามี) เช่น "ค่าเช่าห้อง 841" หรือชื่อห้อง/เลขห้อง — อ่านให้ครบทุกตัวอักษรที่เห็น ถ้าไม่มีข้อความแบบนี้ในสลิปให้ตอบ null
+2. วันที่บนสลิปธนาคารไทยเป็นรูปแบบ วัน/เดือน/ปี (DD/MM/YYYY) เสมอ ห้ามอ่านสลับเป็นเดือน/วัน (MM/DD) แบบสากลอเมริกันเด็ดขาด เช่น 01/07/2569 หมายถึงวันที่ 1 เดือนกรกฎาคม ไม่ใช่วันที่ 1 เดือนมกราคม
+3. ฟิลด์ date ต้องเป็นปีคริสต์ศักราช (ค.ศ.) เสมอ ถ้าวันที่ในสลิปแสดงเป็นปีพุทธศักราช (พ.ศ., ปกติจะเป็นเลข 25xx เช่น 2569) ให้แปลงเป็น ค.ศ. โดยลบ 543 ก่อนตอบ (เช่น พ.ศ. 2569 → ค.ศ. 2026) ห้ามตอบเลขปีพ.ศ.ตรงๆ โดยเด็ดขาด` }
           ]
         }]
       },
@@ -141,16 +147,25 @@ async function handleEvent(event) {
       return { name: a.name, rent: c ? c.rent : a.rent, tenant: c ? c.tenant : '' };
     }).filter(a => a.rent > 0);
 
-    // จับคู่ตามชื่อผู้เช่าก่อน (แม่นยำกว่า) แล้วค่อย fallback เป็นยอดเงิน — กันปัญหาหลายห้องราคาเท่ากัน
+    // จับคู่ห้อง เรียงตามความน่าเชื่อถือ: 1) โน้ตในสลิปที่ระบุห้องตรงๆ 2) ชื่อผู้เช่า 3) ยอดเงินตรงเป๊ะเท่านั้น
+    // ไม่เดาจาก "ยอดใกล้เคียง" อีกต่อไป — เคยจับผิดห้องเวลาผู้เช่าหักค่าใช้จ่ายอื่นออกจากยอดโอนแล้วยอดไปใกล้ห้องอื่นโดยบังเอิญ
+    // ปล่อยว่างไว้ (ไม่ระบุห้อง) ให้คนมาเลือกเองทีหลัง ดีกว่าเดาแล้วผิดแบบไม่มีใครสังเกต
     let matched = null;
-    if (slip.sender_name) {
+    if (slip.memo) {
+      const memoKey = normRoomKey(slip.memo);
+      matched = assets.find(a => {
+        const tag = roomNumTag(a.name);
+        if (tag && slip.memo.includes(tag)) return true;
+        const nk = normRoomKey(a.name);
+        return nk && memoKey.includes(nk);
+      }) || null;
+    }
+    if (!matched && slip.sender_name) {
       const sn = normName(slip.sender_name);
-      if (sn) matched = assets.find(a => a.tenant && (normName(a.tenant).includes(sn) || sn.includes(normName(a.tenant))));
+      if (sn) matched = assets.find(a => a.tenant && (normName(a.tenant).includes(sn) || sn.includes(normName(a.tenant)))) || null;
     }
     if (!matched) {
-      matched = assets.find(a => a.rent === slip.amount)
-        || assets.map(a => ({ ...a, diff: Math.abs(a.rent - (slip.amount||0)) })).filter(a => a.diff <= 500).sort((a,b) => a.diff-b.diff)[0]
-        || null;
+      matched = assets.find(a => a.rent === slip.amount) || null;
     }
 
     const title = matched ? `ค่าเช่า ${matched.name} ${slip.date||''}` : `โอนเงิน ${slip.amount||0}`;
@@ -162,7 +177,7 @@ async function handleEvent(event) {
         'หมวดหมู่': { select: { name: 'ค่าเช่า' } },
         'จำนวนเงิน (บาท)': { number: slip.amount || 0 },
         'สถานะ': { select: { name: 'เสร็จสิ้น' } },
-        'หมายเหตุ': { rich_text: [{ text: { content: `ผู้โอน: ${slip.sender_name||'-'} | อ้างอิง: ${slip.ref_number||'-'}` } }] }
+        'หมายเหตุ': { rich_text: [{ text: { content: `ผู้โอน: ${slip.sender_name||'-'} | อ้างอิง: ${slip.ref_number||'-'}${slip.memo?' | โน้ต: '+slip.memo:''}` } }] }
       }
     };
     if (slip.date) {
