@@ -18,7 +18,13 @@ Set these in the Render service's Environment settings:
 - `NOTION_TOKEN`
 - `NOTION_INCOME_DB_ID` — the "💰 รายรับ-รายจ่าย" database
 - `NOTION_ASSET_DB_ID` — the "AssetLiving" database (used to match slip amounts to rooms)
-- `NOTION_CONTRACT_DB_ID` — the "LeaseAI — สัญญาเช่า" database (`0d3ce732aec048f298c93baa788b5306`). Optional but strongly recommended: without it, room matching falls back to comparing the slip amount against AssetLiving's listed rent, which is often stale/wrong and ambiguous when rooms share the same listed price. With it, matching uses the tenant's name first (much more reliable) and the real contract rent as fallback.
+- `NOTION_CONTRACT_DB_ID` — the "LeaseAI — สัญญาเช่า" database (`0d3ce732aec048f298c93baa788b5306`). Optional but strongly recommended: without it, room matching falls back to comparing the slip amount against AssetLiving's listed rent, which is often stale/wrong and ambiguous when rooms share the same listed price. With it, matching uses the slip's memo text first, then the tenant's name, then the real contract rent — in that order.
+- `LINE_GROUP_ID` — the LINE group/room ID to push daily rent-due reminders to. Get it by typing `กลุ่มไอดี` in the target chat; the bot replies with the ID. Without this set, `checkRentDue()` just logs what it would have sent instead of pushing.
+- `CRON_SECRET` — any random string you choose. Required to call `/cron/check-rent?key=<CRON_SECRET>` (returns 403 otherwise).
+
+## Daily rent-due reminders
+
+`GET /cron/check-rent?key=<CRON_SECRET>` checks every active contract with a `วันครบชำระ` (due day) set in the Contract DB, and if today's day-of-month is on or past the due day with no matching payment recorded in "💰 รายรับ-รายจ่าย" for the current month (`รอบเดือน`), it pushes a summary to `LINE_GROUP_ID`. Render's free web-service tier has no built-in cron, so point an external free scheduler (e.g. cron-job.org) at that URL once a day.
 
 ## Related services (separate repos/hosts, not this one)
 
