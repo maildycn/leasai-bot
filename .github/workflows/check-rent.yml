@@ -1,0 +1,14 @@
+name: Check rent due
+
+on:
+  schedule:
+    - cron: '30 5 * * *' # 12:30 Asia/Bangkok (UTC+7)
+  workflow_dispatch: {}
+
+jobs:
+  check-rent:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call rent-check endpoint
+        run: |
+          curl -sf "https://leasai-bot.onrender.com/cron/check-rent?key=${{ secrets.CRON_SECRET }}"
