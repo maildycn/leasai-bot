@@ -24,7 +24,9 @@ Set these in the Render service's Environment settings:
 
 ## Daily rent-due reminders
 
-`GET /cron/check-rent?key=<CRON_SECRET>` checks every active contract with a `วันครบชำระ` (due day) set in the Contract DB, and if today's day-of-month is on or past the due day with no matching payment recorded in "💰 รายรับ-รายจ่าย" for the current month (`รอบเดือน`), it's overdue. Render's free web-service tier has no built-in cron, so point an external free scheduler (e.g. cron-job.org) at that URL once a day.
+`GET /cron/check-rent?key=<CRON_SECRET>` checks every active contract with a `วันครบชำระ` (due day) set in the Contract DB, and if today's day-of-month is on or past the due day with no matching payment recorded in "💰 รายรับ-รายจ่าย" for the current month (`รอบเดือน`), it's overdue. Render's free web-service tier has no built-in cron, so something external has to hit that URL once a day.
+
+**Scheduler: GitHub Actions**, not cron-job.org. `.github/workflows/check-rent.yml` in this repo runs daily at 12:30 Asia/Bangkok (`30 5 * * *` UTC) via `workflow_dispatch`-triggerable schedule, and calls the endpoint with `${{ secrets.CRON_SECRET }}` (set as a GitHub Actions repo secret, same value as the Render env var). **Do not switch back to cron-job.org** — as of 2026-07-25 Render was returning `429 Too Many Requests` to every request from cron-job.org's IPs (confirmed via cron-job.org's execution history), so the reminder silently never fired for days despite being configured correctly. The cron-job.org job (`เช็คค่าเช่าค้าง`) still exists but was disabled, left as a reference/backup only.
 
 Per contract, two more fields control where the reminder goes:
 - `LINE Group ID` — if set, a personalized reminder is pushed directly to that tenant's own group instead of the main one. Get a group's ID by typing `กลุ่มไอดี` in it.
