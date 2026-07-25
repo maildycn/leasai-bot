@@ -130,12 +130,15 @@ async function checkRentDue() {
     { page_size: 100, filter: { property: 'รอบเดือน', select: { equals: monthKey } } },
     { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
   );
-  const paidRooms = new Set(
-    iRes.data.results.map(p => p.properties['ห้อง / ทรัพย์สิน']?.rich_text?.[0]?.plain_text).filter(Boolean)
+  // เทียบด้วย normRoomKey แทน exact match กันเคสพิมพ์ชื่อห้องใน Income DB เพี้ยนจาก AssetLiving DB นิดหน่อย (ช่องว่าง/ตัวพิมพ์) แล้วระบบมองว่ายังไม่จ่าย ทั้งที่จ่ายแล้ว
+  const paidRoomKeys = new Set(
+    iRes.data.results
+      .map(p => normRoomKey(p.properties['ห้อง / ทรัพย์สิน']?.rich_text?.[0]?.plain_text))
+      .filter(Boolean)
   );
 
   // ห้องที่ติ๊ก "ใช้บอทขุนทองอยู่แล้ว" ข้ามไปเลย กันแจ้งซ้ำซ้อนกับอีกบอท
-  const overdue = assets.filter(a => day >= a.dueDay && !paidRooms.has(a.name) && !a.skipReminder);
+  const overdue = assets.filter(a => day >= a.dueDay && !paidRoomKeys.has(normRoomKey(a.name)) && !a.skipReminder);
   summary.overdueRooms = overdue.map(a => a.name);
   if (!overdue.length) return summary;
 
