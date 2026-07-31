@@ -125,20 +125,29 @@ async function checkRentDue() {
   const day = today.getDate();
   const monthKey = today.toISOString().slice(0, 7); // YYYY-MM
 
-  const iRes = await axios.post(
-    `https://api.notion.com/v1/databases/${NOTION_INCOME_DB}/query`,
-    { page_size: 100, filter: { property: 'รอบเดือน', select: { equals: monthKey } } },
-    { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
-  );
+  // page_size:100 เดียวไม่พอ — เดือนที่มีรายการ (รวมรายจ่าย) เกิน 100 แถว จะดึงมาไม่ครบ ทำให้ห้องที่จ่ายแล้วหลุดจากเช็ค ต้องวนดึงทุกหน้า
+  let incomeResults = [];
+  let startCursor;
+  do {
+    const iRes = await axios.post(
+      `https://api.notion.com/v1/databases/${NOTION_INCOME_DB}/query`,
+      { page_size: 100, start_cursor: startCursor, filter: { property: 'รอบเดือน', select: { equals: monthKey } } },
+      { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
+    );
+    incomeResults = incomeResults.concat(iRes.data.results);
+    startCursor = iRes.data.has_more ? iRes.data.next_cursor : undefined;
+  } while (startCursor);
+
   // เทียบด้วย normRoomKey แทน exact match กันเคสพิมพ์ชื่อห้องใน Income DB เพี้ยนจาก AssetLiving DB นิดหน่อย (ช่องว่าง/ตัวพิมพ์) แล้วระบบมองว่ายังไม่จ่าย ทั้งที่จ่ายแล้ว
   const paidRoomKeys = new Set(
-    iRes.data.results
+    incomeResults
       .map(p => normRoomKey(p.properties['ห้อง / ทรัพย์สิน']?.rich_text?.[0]?.plain_text))
       .filter(Boolean)
   );
 
   // ห้องที่ติ๊ก "ใช้บอทขุนทองอยู่แล้ว" ข้ามไปเลย กันแจ้งซ้ำซ้อนกับอีกบอท
-  const overdue = assets.filter(a => day >= a.dueDay && !paidRoomKeys.has(normRoomKey(a.name)) && !a.skipReminder);
+  // day > dueDay (ไม่ใช่ >=) เพราะหลายสัญญามี grace period ในตัว (เช่น "ชำระภายในวันที่ 1-4") — วันครบกำหนดพอดียังไม่ถือว่าค้างชำระ
+  const overdue = assets.filter(a => day > a.dueDay && !paidRoomKeys.has(normRoomKey(a.name)) && !a.skipReminder);
   summary.overdueRooms = overdue.map(a => a.name);
   if (!overdue.length) return summary;
 
@@ -296,10 +305,10 @@ async function handleEvent(event) {
         'หมายเหตุ': { rich_text: [{ text: { content: `ผู้โอน: ${slip.sender_name||'-'} | อ้างอิง: ${slip.ref_number||'-'}${slip.memo?' | โน้ต: '+slip.memo:''}` } }] }
       }
     };
-    if (slip.date) {
-      body.properties['วันที่'] = { date: { start: slip.date } };
-      body.properties['รอบเดือน'] = { select: { name: slip.date.slice(0, 7) } };
-    }
+    // ถ้า AI อ่านวันที่จากสลิปไม่ได้ ใช้วันที่ที่ระบบได้รับรูปแทน — กันไม่ให้ "รอบเดือน" หายไปเฉยๆ จนเช็คค่าเช่าค้างมองไม่เห็นการจ่ายเงินนี้ทั้งเดือน
+    const recordDate = slip.date || new Date().toISOString().slice(0, 10);
+    body.properties['วันที่'] = { date: { start: recordDate } };
+    body.properties['รอบเดือน'] = { select: { name: recordDate.slice(0, 7) } };
     if (matched)   body.properties['ห้อง / ทรัพย์สิน'] = { rich_text: [{ text: { content: matched.name } }] };
 
     await axios.post('https://api.notion.com/v1/pages', body,
