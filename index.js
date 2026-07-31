@@ -290,7 +290,10 @@ async function handleEvent(event) {
       if (sn) matched = assets.find(a => a.tenant && (normName(a.tenant).includes(sn) || sn.includes(normName(a.tenant)))) || null;
     }
     if (!matched) {
-      matched = assets.find(a => a.rent === slip.amount) || null;
+      // ห้ามเดาถ้ามีมากกว่า 1 ห้องค่าเช่าเท่ากันพอดี (เช่น 464/4 กับ 466/166 ค่าเช่า 9,500 เท่ากัน)
+      // เดิม .find() คว้าห้องแรกในลิสต์เงียบๆ โดยไม่เช็คว่ายอดชนกับห้องอื่นด้วย ทำให้จับผิดห้องแบบไม่มีใครสังเกต
+      const rentMatches = assets.filter(a => a.rent === slip.amount);
+      matched = rentMatches.length === 1 ? rentMatches[0] : null;
     }
 
     const title = matched ? `ค่าเช่า ${matched.name} ${slip.date||''}` : `โอนเงิน ${slip.amount||0}`;
