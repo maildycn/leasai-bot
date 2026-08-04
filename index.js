@@ -419,7 +419,19 @@ async function handleEvent(event) {
     // ถ้า AI อ่านวันที่จากสลิปไม่ได้ ใช้วันที่ที่ระบบได้รับรูปแทน — กันไม่ให้ "รอบเดือน" หายไปเฉยๆ จนเช็คค่าเช่าค้างมองไม่เห็นการจ่ายเงินนี้ทั้งเดือน
     const recordDate = slip.date || new Date().toISOString().slice(0, 10);
     body.properties['วันที่'] = { date: { start: recordDate } };
-    body.properties['รอบเดือน'] = { select: { name: recordDate.slice(0, 7) } };
+
+    // ค่าเช่าจ่ายล่วงหน้าเสมอ (จ่ายก่อนเข้าอยู่เดือนถัดไป ไม่ใช่จ่ายย้อนหลังของเดือนที่อยู่แล้ว) — ถ้าวันที่โอนเลยวันครบชำระของห้องนั้นในเดือนนั้นไปแล้ว
+    // แปลว่ากำลังจ่ายล่วงหน้าให้เดือนถัดไป เช่น ห้องครบชำระทุกวันที่ 1 โอนวันที่ 31 ก.ค. คือค่าเช่าเดือนสิงหาคม ไม่ใช่กรกฎาคม
+    let cycleMonth = recordDate.slice(0, 7);
+    if (matched && matched.dueDay) {
+      const d = new Date(recordDate + 'T00:00:00Z');
+      if (d.getUTCDate() > matched.dueDay) {
+        d.setUTCMonth(d.getUTCMonth() + 1);
+        cycleMonth = d.toISOString().slice(0, 7);
+      }
+    }
+    await ensureMonthOption(cycleMonth);
+    body.properties['รอบเดือน'] = { select: { name: cycleMonth } };
     if (matched)          body.properties['ห้อง / ทรัพย์สิน'] = { rich_text: [{ text: { content: matched.name } }] };
     if (slip.ref_number)  body.properties['เลขอ้างอิง'] = { rich_text: [{ text: { content: slip.ref_number } }] };
 
