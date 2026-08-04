@@ -105,6 +105,24 @@ async function fetchAssetsWithContracts() {
   }).filter(a => a.rent > 0);
 }
 
+// เดือนใหม่ทุกเดือนต้องมี option "YYYY-MM" นี้อยู่ใน property "รอบเดือน" ของ Income DB ก่อน ไม่งั้น query filter ด้วย select.equals จะพัง 400
+// (ต่างจากตอนสร้างเพจใหม่ที่ Notion auto-add option ให้เองได้ — query filter ไม่ auto-add ให้) เรียกก่อน query ทุกครั้งเพื่อกันไม่ให้ cron พังตอนต้นเดือน
+async function ensureMonthOption(monthKey) {
+  const dbRes = await axios.get(
+    `https://api.notion.com/v1/databases/${NOTION_INCOME_DB}`,
+    { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28' } }
+  );
+  const prop = dbRes.data.properties['รอบเดือน'];
+  const exists = prop?.select?.options?.some(o => o.name === monthKey);
+  if (exists) return;
+
+  await axios.patch(
+    `https://api.notion.com/v1/databases/${NOTION_INCOME_DB}`,
+    { properties: { 'รอบเดือน': { select: { options: [...prop.select.options, { name: monthKey }] } } } },
+    { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
+  );
+}
+
 // เช็คค่าเช่าค้างชำระวันนี้ แล้วส่งแจ้งเตือนเข้ากลุ่ม LINE — คืนค่าสรุปผลกลับไปด้วยเพื่อใช้ debug ผ่าน HTTP response โดยตรง ไม่ต้องพึ่ง server log
 async function checkRentDue() {
   const summary = {
@@ -125,15 +143,24 @@ async function checkRentDue() {
   const day = today.getDate();
   const monthKey = today.toISOString().slice(0, 7); // YYYY-MM
 
+  await ensureMonthOption(monthKey);
+
   // page_size:100 เดียวไม่พอ — เดือนที่มีรายการ (รวมรายจ่าย) เกิน 100 แถว จะดึงมาไม่ครบ ทำให้ห้องที่จ่ายแล้วหลุดจากเช็ค ต้องวนดึงทุกหน้า
   let incomeResults = [];
   let startCursor;
   do {
-    const iRes = await axios.post(
-      `https://api.notion.com/v1/databases/${NOTION_INCOME_DB}/query`,
-      { page_size: 100, start_cursor: startCursor, filter: { property: 'รอบเดือน', select: { equals: monthKey } } },
-      { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
-    );
+    let iRes;
+    try {
+      iRes = await axios.post(
+        `https://api.notion.com/v1/databases/${NOTION_INCOME_DB}/query`,
+        { page_size: 100, start_cursor: startCursor, filter: { property: 'รอบเดือน', select: { equals: monthKey } } },
+        { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
+      );
+    } catch (err) {
+      // เผื่อ ensureMonthOption เพิ่ง add option ไปแต่ Notion ยัง propagate ไม่ทัน — ถือว่าเดือนนี้ยังไม่มีใครจ่ายแทนที่จะพังทั้ง cron
+      if (err.response?.data?.code === 'validation_error') { incomeResults = []; break; }
+      throw err;
+    }
     incomeResults = incomeResults.concat(iRes.data.results);
     startCursor = iRes.data.has_more ? iRes.data.next_cursor : undefined;
   } while (startCursor);
