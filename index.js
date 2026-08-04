@@ -249,6 +249,28 @@ async function handleEvent(event) {
     await reply(event.replyToken, `ID: ${id}`);
     return;
   }
+
+  // ผู้เช่ากดปุ่มยืนยันห้องจาก quick reply ที่ส่งไปตอนจับคู่ห้องไม่ได้ — แก้ property ห้องของรายการที่สร้างไว้แล้ว ไม่สร้างรายการใหม่ซ้อน
+  if (event.type === 'postback') {
+    const data = event.postback.data || '';
+    const to   = event.source.groupId || event.source.roomId || event.source.userId;
+    if (data.startsWith('confirm_room|')) {
+      const [, pageId, roomNameEnc] = data.split('|');
+      const roomName = decodeURIComponent(roomNameEnc);
+      try {
+        await axios.patch(`https://api.notion.com/v1/pages/${pageId}`,
+          { properties: { 'ห้อง / ทรัพย์สิน': { rich_text: [{ text: { content: roomName } }] } } },
+          { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
+        );
+        await push(to, `✅ ยืนยันแล้วครับ บันทึกเป็นห้อง ${roomName}`);
+      } catch (err) {
+        console.error('Confirm-room ERR:', err.response?.data || err.message);
+        await push(to, `❌ ยืนยันห้องไม่สำเร็จ: ${err.message}`).catch(()=>{});
+      }
+    }
+    return;
+  }
+
   if (event.type !== 'message' || event.message.type !== 'image') return;
   const msgId = event.message.id;
   const to    = event.source.groupId || event.source.roomId || event.source.userId;
@@ -297,13 +319,29 @@ async function handleEvent(event) {
     if (fixedDate && fixedDate !== slip.date) console.log('Date corrected:', slip.date, '->', fixedDate);
     slip.date = fixedDate;
 
+    // กันสลิปซ้ำ — ถ้าเลขอ้างอิงตรงกับรายการที่เคยบันทึกไว้แล้ว (เช่น ผู้เช่าส่งซ้ำเพราะคิดว่าบอทไม่ตอบ ก่อนแก้เรื่อง replyToken หมดอายุ) ไม่สร้างรายการใหม่ซ้อน
+    if (slip.ref_number) {
+      const dupRes = await axios.post(
+        `https://api.notion.com/v1/databases/${NOTION_INCOME_DB}/query`,
+        { page_size: 1, filter: { property: 'เลขอ้างอิง', rich_text: { equals: slip.ref_number } } },
+        { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
+      );
+      if (dupRes.data.results.length) {
+        const prevRoom = dupRes.data.results[0].properties['ห้อง / ทรัพย์สิน']?.rich_text?.[0]?.plain_text || 'ไม่ระบุห้อง';
+        await push(to, `⚠️ สลิปนี้บันทึกไปแล้วก่อนหน้านี้ครับ (เลขอ้างอิง ${slip.ref_number} — ห้อง ${prevRoom}) ไม่ได้บันทึกซ้ำให้นะครับ`);
+        return;
+      }
+    }
+
     const assets = await fetchAssetsWithContracts();
 
-    // จับคู่ห้อง เรียงตามความน่าเชื่อถือ: 1) โน้ตในสลิปที่ระบุห้องตรงๆ 2) ชื่อผู้เช่า 3) ยอดเงินตรงเป๊ะเท่านั้น
+    // จับคู่ห้อง เรียงตามความน่าเชื่อถือ: 1) กลุ่มไลน์ของห้องนั้นเอง (ตั้งไว้ใน Contract DB — แม่นสุดเพราะรู้แน่ว่าใครส่งมาจากกลุ่มไหน)
+    // 2) โน้ตในสลิปที่ระบุห้องตรงๆ 3) ชื่อผู้เช่า 4) ยอดเงินตรงเป๊ะเท่านั้น
     // ไม่เดาจาก "ยอดใกล้เคียง" อีกต่อไป — เคยจับผิดห้องเวลาผู้เช่าหักค่าใช้จ่ายอื่นออกจากยอดโอนแล้วยอดไปใกล้ห้องอื่นโดยบังเอิญ
-    // ปล่อยว่างไว้ (ไม่ระบุห้อง) ให้คนมาเลือกเองทีหลัง ดีกว่าเดาแล้วผิดแบบไม่มีใครสังเกต
-    let matched = null;
-    if (slip.memo) {
+    // ถ้ายังจับคู่ไม่ได้ชัดเจน (ไม่เจอเลย หรือเจอมากกว่า 1 ห้องพอดี) ส่ง quick reply ให้กดยืนยันเอง ดีกว่าเดาแล้วผิดแบบไม่มีใครสังเกต
+    let matched = assets.find(a => a.tenantGroupId && a.tenantGroupId === to) || null;
+    let candidates = [];
+    if (!matched && slip.memo) {
       const memoKey = normRoomKey(slip.memo);
       matched = assets.find(a => {
         const tag = roomNumTag(a.name);
@@ -320,7 +358,9 @@ async function handleEvent(event) {
       // ห้ามเดาถ้ามีมากกว่า 1 ห้องค่าเช่าเท่ากันพอดี (เช่น 464/4 กับ 466/166 ค่าเช่า 9,500 เท่ากัน)
       // เดิม .find() คว้าห้องแรกในลิสต์เงียบๆ โดยไม่เช็คว่ายอดชนกับห้องอื่นด้วย ทำให้จับผิดห้องแบบไม่มีใครสังเกต
       const rentMatches = assets.filter(a => a.rent === slip.amount);
-      matched = rentMatches.length === 1 ? rentMatches[0] : null;
+      if (rentMatches.length === 1) matched = rentMatches[0];
+      else if (rentMatches.length > 1) candidates = rentMatches;
+      else candidates = assets.slice(0, 13); // LINE quick reply จำกัด 13 ปุ่ม
     }
 
     const title = matched ? `ค่าเช่า ${matched.name} ${slip.date||''}` : `โอนเงิน ${slip.amount||0}`;
@@ -339,17 +379,23 @@ async function handleEvent(event) {
     const recordDate = slip.date || new Date().toISOString().slice(0, 10);
     body.properties['วันที่'] = { date: { start: recordDate } };
     body.properties['รอบเดือน'] = { select: { name: recordDate.slice(0, 7) } };
-    if (matched)   body.properties['ห้อง / ทรัพย์สิน'] = { rich_text: [{ text: { content: matched.name } }] };
+    if (matched)          body.properties['ห้อง / ทรัพย์สิน'] = { rich_text: [{ text: { content: matched.name } }] };
+    if (slip.ref_number)  body.properties['เลขอ้างอิง'] = { rich_text: [{ text: { content: slip.ref_number } }] };
 
-    await axios.post('https://api.notion.com/v1/pages', body,
+    const createRes = await axios.post('https://api.notion.com/v1/pages', body,
       { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
     );
 
     const amt = slip.amount ? `฿${slip.amount.toLocaleString()}` : '?';
     let msg = `✅ รับสลิปแล้วครับ\n━━━━━━━━━━━━━━\n💰 ยอด: ${amt}\n👤 ผู้โอน: ${slip.sender_name||'ไม่ระบุ'}\n📅 วันที่: ${slip.date||'ไม่ระบุ'}\n🔖 อ้างอิง: ${slip.ref_number||'ไม่ระบุ'}\n`;
-    msg += matched ? `\n🏠 ห้อง: ${matched.name}\n📝 บันทึก Notion เรียบร้อยแล้วครับ` : `\n❓ ไม่พบห้องที่ตรงกับยอด\n📝 บันทึก Notion แล้ว`;
 
-    await push(to, msg);
+    if (matched) {
+      msg += `\n🏠 ห้อง: ${matched.name}\n📝 บันทึก Notion เรียบร้อยแล้วครับ`;
+      await push(to, msg);
+    } else {
+      msg += `\n❓ ไม่พบห้องที่ตรงกับยอดชัดเจน กดยืนยันห้องด้านล่างนี้ได้เลยครับ\n📝 บันทึกไว้ชั่วคราวแล้ว`;
+      await pushRoomConfirm(to, msg, createRes.data.id, candidates);
+    }
 
   } catch (err) {
     console.error('ERR:', err.response?.status, JSON.stringify(err.response?.data), err.message);
@@ -370,6 +416,26 @@ async function reply(token, text) {
 async function push(to, text) {
   await axios.post('https://api.line.me/v2/bot/message/push',
     { to, messages: [{ type: 'text', text }] },
+    { headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' } }
+  );
+}
+
+// ส่งข้อความพร้อมปุ่ม quick reply ให้กดยืนยันห้อง — แต่ละปุ่มเป็น postback คู่กับ pageId ของรายการที่สร้างไว้แล้ว
+// เพื่อให้กดแล้วไปแก้ property ห้องของรายการเดิม ไม่ใช่สร้างรายการใหม่ซ้อน
+async function pushRoomConfirm(to, text, pageId, candidates) {
+  const items = candidates.slice(0, 13).map(a => ({
+    type: 'action',
+    action: {
+      type: 'postback',
+      label: a.name.slice(0, 20),
+      data: `confirm_room|${pageId}|${encodeURIComponent(a.name)}`,
+      displayText: `ยืนยันห้อง ${a.name}`
+    }
+  }));
+  const messages = [{ type: 'text', text }];
+  if (items.length) messages[0].quickReply = { items };
+  await axios.post('https://api.line.me/v2/bot/message/push',
+    { to, messages },
     { headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' } }
   );
 }
