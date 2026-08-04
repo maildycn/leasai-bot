@@ -125,6 +125,39 @@ async function ensureMonthOption(monthKey) {
   );
 }
 
+// รวมยอดค่าเช่าที่ได้รับจริง + รายจ่ายที่หักได้ (ซ่อมแซม/ค่าน้ำ-ไฟ) ของห้องหนึ่งในเดือนหนึ่ง — เรียกสดทุกครั้งที่ต้องเช็คว่าขาดอยู่เท่าไหร่
+// (ไม่ cache ผลจาก checkRentDue เพราะต้องเช็ค ณ เวลาจริงตอนมีสลิป/กดปุ่มเข้ามา ไม่ใช่แค่ตอน cron รันรอบเดียวต่อวัน)
+async function getRoomMonthTotal(roomName, monthKey) {
+  let results = [];
+  let startCursor;
+  do {
+    const res = await axios.post(
+      `https://api.notion.com/v1/databases/${NOTION_INCOME_DB}/query`,
+      {
+        page_size: 100,
+        start_cursor: startCursor,
+        filter: { and: [
+          { property: 'รอบเดือน', select: { equals: monthKey } },
+          { property: 'ห้อง / ทรัพย์สิน', rich_text: { equals: roomName } },
+        ] },
+      },
+      { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
+    );
+    results = results.concat(res.data.results);
+    startCursor = res.data.has_more ? res.data.next_cursor : undefined;
+  } while (startCursor);
+
+  let received = 0, offset = 0;
+  for (const p of results) {
+    const amount   = p.properties['จำนวนเงิน (บาท)']?.number || 0;
+    const type     = p.properties['ประเภท']?.select?.name;
+    const category = p.properties['หมวดหมู่']?.select?.name;
+    if (type === 'รายรับ' && category === 'ค่าเช่า') received += amount;
+    else if (type === 'รายจ่าย' && (category === 'ซ่อมแซม' || category === 'ค่าน้ำ-ไฟ')) offset += amount;
+  }
+  return { received, offset };
+}
+
 // เช็คค่าเช่าค้างชำระวันนี้ แล้วส่งแจ้งเตือนเข้ากลุ่ม LINE — คืนค่าสรุปผลกลับไปด้วยเพื่อใช้ debug ผ่าน HTTP response โดยตรง ไม่ต้องพึ่ง server log
 async function checkRentDue() {
   const summary = {
@@ -296,6 +329,47 @@ async function handleEvent(event) {
         await push(to, `❌ ยืนยันห้องไม่สำเร็จ: ${err.message}`).catch(()=>{});
       }
     }
+
+    // กดยืนยันเหตุผลที่ยอดค่าเช่าขาด (ค่าซ่อม/ค่าน้ำ-ไฟ) — คำนวณส่วนต่างใหม่ ณ ตอนกดเสมอ ไม่ใช้ตัวเลขเก่าตอนส่งปุ่ม
+    // กันยอดซ้ำกับกรณีที่ผู้เช่าส่งใบเสร็จแยกมาต่างหากแล้ว (handleDeductionReceipt) — ถ้ายอดครบแล้วจะไม่สร้างรายการซ้ำให้
+    if (data.startsWith('deduct_shortfall|')) {
+      const [, category, roomNameEnc, monthKey] = data.split('|');
+      const roomName = decodeURIComponent(roomNameEnc);
+      try {
+        const assets = await fetchAssetsWithContracts();
+        const room = assets.find(a => a.name === roomName);
+        if (!room) { await push(to, `❌ ไม่พบห้อง ${roomName} แล้วครับ`); return; }
+
+        const { received, offset } = await getRoomMonthTotal(roomName, monthKey);
+        const shortfall = room.rent - (received + offset);
+        if (shortfall <= 0) {
+          await syncContractPaymentStatus(room.contractPageId, 'ชำระแล้ว');
+          await push(to, `✅ ยอดครบแล้วครับ ไม่ต้องเพิ่มรายการซ้ำนะครับ`);
+          return;
+        }
+
+        await ensureMonthOption(monthKey);
+        await axios.post('https://api.notion.com/v1/pages', {
+          parent: { database_id: NOTION_INCOME_DB },
+          properties: {
+            'รายการ':           { title: [{ text: { content: `${category} ${roomName} ${monthKey}` } }] },
+            'ประเภท':            { select: { name: 'รายจ่าย' } },
+            'หมวดหมู่':          { select: { name: category } },
+            'จำนวนเงิน (บาท)':  { number: shortfall },
+            'สถานะ':             { select: { name: 'เสร็จสิ้น' } },
+            'รอบเดือน':          { select: { name: monthKey } },
+            'ห้อง / ทรัพย์สิน':  { rich_text: [{ text: { content: roomName } }] },
+            'หมายเหตุ':          { rich_text: [{ text: { content: `หักส่วนต่างค่าเช่าที่ขาดจากสลิป — ยืนยันเป็น${category}ผ่านปุ่มกด` } }] },
+          }
+        }, { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } });
+
+        await syncContractPaymentStatus(room.contractPageId, 'ชำระแล้ว');
+        await push(to, `✅ บันทึกส่วนต่าง ฿${shortfall.toLocaleString()} เป็น${category}แล้วครับ ตอนนี้ห้อง ${roomName} ครบค่าเช่าเดือน ${monthKey} แล้ว`);
+      } catch (err) {
+        console.error('deduct_shortfall ERR:', err.response?.data || err.message);
+        await push(to, `❌ บันทึกไม่สำเร็จ: ${err.message}`).catch(()=>{});
+      }
+    }
     return;
   }
 
@@ -445,8 +519,16 @@ async function handleEvent(event) {
 
     if (matched) {
       msg += `\n🏠 ห้อง: ${matched.name}\n📝 บันทึก Notion เรียบร้อยแล้วครับ`;
-      await syncContractPaymentStatus(matched.contractPageId, 'ชำระแล้ว');
-      await push(to, msg);
+      // เช็คยอดรวมทั้งเดือนสด ๆ ไม่ใช่แค่สลิปใบนี้ใบเดียว เผื่อมีรายจ่ายหักไว้ก่อนแล้วจากใบเสร็จอื่น
+      const { received, offset } = await getRoomMonthTotal(matched.name, cycleMonth);
+      const shortfall = matched.rent - (received + offset);
+      if (shortfall > 0) {
+        msg += `\n\n⚠️ ยอดรวมเดือนนี้ยังขาดอยู่ ฿${shortfall.toLocaleString()} จากค่าเช่าเต็ม ฿${matched.rent.toLocaleString()} ถ้าขาดเพราะหักค่าซ่อม/ค่าน้ำ-ไฟ กดยืนยันด้านล่างได้เลยครับ`;
+        await pushShortfallConfirm(to, msg, matched.name, cycleMonth);
+      } else {
+        await syncContractPaymentStatus(matched.contractPageId, 'ชำระแล้ว');
+        await push(to, msg);
+      }
     } else {
       msg += `\n❓ ไม่พบห้องที่ตรงกับยอดชัดเจน กดยืนยันห้องด้านล่างนี้ได้เลยครับ\n📝 บันทึกไว้ชั่วคราวแล้ว`;
       await pushRoomConfirm(to, msg, createRes.data.id, candidates, 'rent');
@@ -537,6 +619,18 @@ async function pushRoomConfirm(to, text, pageId, candidates, kind) {
   if (items.length) messages[0].quickReply = { items };
   await axios.post('https://api.line.me/v2/bot/message/push',
     { to, messages },
+    { headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' } }
+  );
+}
+
+// ส่งปุ่มให้เลือกเหตุผลที่ยอดค่าเช่าขาด — กดแล้วไปสร้างรายจ่ายหักส่วนต่างให้อัตโนมัติ (ดูตอนรับ postback "deduct_shortfall")
+async function pushShortfallConfirm(to, text, roomName, monthKey) {
+  const items = [
+    { type: 'action', action: { type: 'postback', label: 'ค่าซ่อม', data: `deduct_shortfall|ซ่อมแซม|${encodeURIComponent(roomName)}|${monthKey}`, displayText: 'ขาดเพราะหักค่าซ่อม' } },
+    { type: 'action', action: { type: 'postback', label: 'ค่าน้ำ-ไฟ', data: `deduct_shortfall|ค่าน้ำ-ไฟ|${encodeURIComponent(roomName)}|${monthKey}`, displayText: 'ขาดเพราะหักค่าน้ำ-ไฟ' } },
+  ];
+  await axios.post('https://api.line.me/v2/bot/message/push',
+    { to, messages: [{ type: 'text', text, quickReply: { items } }] },
     { headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' } }
   );
 }
