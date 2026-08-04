@@ -313,8 +313,17 @@ async function handleEvent(event) {
       const [, kind, pageId, roomNameEnc] = data.split('|');
       const roomName = decodeURIComponent(roomNameEnc);
       try {
+        // ดึงหมวดหมู่+รอบเดือนเดิมมาตั้งชื่อ "รายการ" ใหม่ให้ตรงห้องที่เพิ่งยืนยัน — ไม่งั้นชื่อจะค้างเป็น "โอนเงิน X" ตลอดไปทั้งที่รู้ห้องแล้ว ดูสับสนเวลาเปิดดูรายเดือน
+        const pageRes = await axios.get(`https://api.notion.com/v1/pages/${pageId}`,
+          { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28' } }
+        );
+        const cat   = pageRes.data.properties['หมวดหมู่']?.select?.name || 'ค่าเช่า';
+        const cycle = pageRes.data.properties['รอบเดือน']?.select?.name || '';
         await axios.patch(`https://api.notion.com/v1/pages/${pageId}`,
-          { properties: { 'ห้อง / ทรัพย์สิน': { rich_text: [{ text: { content: roomName } }] } } },
+          { properties: {
+              'ห้อง / ทรัพย์สิน': { rich_text: [{ text: { content: roomName } }] },
+              'รายการ':           { title: [{ text: { content: `${cat} ${roomName} ${cycle}`.trim() } }] },
+            } },
           { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
         );
         // แค่ค่าเช่าเท่านั้นที่ยืนยันห้องแล้วถือว่า "ชำระแล้ว" — ใบเสร็จซ่อมไม่ใช่การจ่ายค่าเช่า ไม่ควรไปทับสถานะการชำระ
@@ -479,7 +488,8 @@ async function handleEvent(event) {
       else candidates = assets.slice(0, 13); // LINE quick reply จำกัด 13 ปุ่ม
     }
 
-    const title = matched ? `ค่าเช่า ${matched.name} ${slip.date||''}` : `โอนเงิน ${slip.amount||0}`;
+    // ตอนจับคู่ห้องไม่ได้ ตั้งชื่อ "รายการ" ชั่วคราวไปก่อน — ยืนยันห้องทีหลังผ่านปุ่มแล้วจะเปลี่ยนชื่อให้ตรงห้อง+รอบเดือนอัตโนมัติ (ดูตอนรับ postback "confirm_room")
+    const title = matched ? `ค่าเช่า ${matched.name}` : `โอนเงิน ${slip.amount||0}`;
     const body = {
       parent: { database_id: NOTION_INCOME_DB },
       properties: {
@@ -507,7 +517,11 @@ async function handleEvent(event) {
     }
     await ensureMonthOption(cycleMonth);
     body.properties['รอบเดือน'] = { select: { name: cycleMonth } };
-    if (matched)          body.properties['ห้อง / ทรัพย์สิน'] = { rich_text: [{ text: { content: matched.name } }] };
+    // ตั้งชื่อ "รายการ" ด้วยรอบเดือน (ไม่ใช่วันที่โอนดิบๆ) ให้ตรงกับคอลัมน์ที่มันจะไปอยู่ในมุมมองแยกตามเดือนเสมอ — กันสับสนเวลาสลิปจ่ายล่วงหน้าข้ามเดือน
+    if (matched) {
+      body.properties['รายการ']       = { title: [{ text: { content: `ค่าเช่า ${matched.name} ${cycleMonth}` } }] };
+      body.properties['ห้อง / ทรัพย์สิน'] = { rich_text: [{ text: { content: matched.name } }] };
+    }
     if (slip.ref_number)  body.properties['เลขอ้างอิง'] = { rich_text: [{ text: { content: slip.ref_number } }] };
 
     const createRes = await axios.post('https://api.notion.com/v1/pages', body,
@@ -572,7 +586,7 @@ async function handleDeductionReceipt(doc, to) {
   const amount   = doc.amount || 0;
   const category = doc.deduction_category === 'ค่าน้ำ-ไฟ' ? 'ค่าน้ำ-ไฟ' : 'ซ่อมแซม';
   const desc     = doc.deduction_description || category;
-  const title    = matched ? `${category} ${matched.name} ${recordDate}` : `${category} ${desc}`;
+  const title    = matched ? `${category} ${matched.name} ${monthKey}` : `${category} ${desc}`;
   const body = {
     parent: { database_id: NOTION_INCOME_DB },
     properties: {
