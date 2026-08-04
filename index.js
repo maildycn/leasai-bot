@@ -250,8 +250,8 @@ async function handleEvent(event) {
     return;
   }
   if (event.type !== 'message' || event.message.type !== 'image') return;
-  const msgId      = event.message.id;
-  const replyToken = event.replyToken;
+  const msgId = event.message.id;
+  const to    = event.source.groupId || event.source.roomId || event.source.userId;
   console.log('IMAGE msgId:', msgId);
 
   try {
@@ -349,17 +349,27 @@ async function handleEvent(event) {
     let msg = `✅ รับสลิปแล้วครับ\n━━━━━━━━━━━━━━\n💰 ยอด: ${amt}\n👤 ผู้โอน: ${slip.sender_name||'ไม่ระบุ'}\n📅 วันที่: ${slip.date||'ไม่ระบุ'}\n🔖 อ้างอิง: ${slip.ref_number||'ไม่ระบุ'}\n`;
     msg += matched ? `\n🏠 ห้อง: ${matched.name}\n📝 บันทึก Notion เรียบร้อยแล้วครับ` : `\n❓ ไม่พบห้องที่ตรงกับยอด\n📝 บันทึก Notion แล้ว`;
 
-    await reply(replyToken, msg);
+    await push(to, msg);
 
   } catch (err) {
     console.error('ERR:', err.response?.status, JSON.stringify(err.response?.data), err.message);
-    await reply(replyToken, `❌ Error ${err.response?.status||''}: ${err.message}`).catch(()=>{});
+    await push(to, `❌ Error ${err.response?.status||''}: ${err.message}`).catch(()=>{});
   }
 }
 
 async function reply(token, text) {
   await axios.post('https://api.line.me/v2/bot/message/reply',
     { replyToken: token, messages: [{ type: 'text', text }] },
+    { headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' } }
+  );
+}
+
+// replyToken หมดอายุใน ~60 วิ และใช้ได้ครั้งเดียว — สลิปที่ประมวลผลช้า (cold start + Claude vision + Notion)
+// มักเกินเวลานั้น ทำให้ reply เงียบ ไม่มีใครเห็นว่าทำงานสำเร็จ ต้องส่งสลิปซ้ำจนกลายเป็นบันทึกซ้ำใน Notion
+// ใช้ push แทนสำหรับข้อความผลลัพธ์ เพราะ push ผูกกับ group/room/user id ไม่มีวันหมดอายุ
+async function push(to, text) {
+  await axios.post('https://api.line.me/v2/bot/message/push',
+    { to, messages: [{ type: 'text', text }] },
     { headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' } }
   );
 }
