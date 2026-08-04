@@ -80,6 +80,7 @@ async function fetchAssetsWithContracts() {
     );
     contracts = cRes.data.results
       .map(p => ({
+        id: p.id,
         tenant: p.properties['ชื่อผู้เช่า']?.title?.[0]?.plain_text || '',
         room: p.properties['ทรัพย์สิน / ห้อง']?.rich_text?.[0]?.plain_text || '',
         rent: p.properties['ค่าเช่า (บาท/เดือน)']?.number || 0,
@@ -101,6 +102,7 @@ async function fetchAssetsWithContracts() {
       dueDay: c ? c.dueDay : null,
       tenantGroupId: c ? c.tenantGroupId : '',
       skipReminder: c ? c.skipReminder : false,
+      contractPageId: c ? c.id : null,
     };
   }).filter(a => a.rent > 0);
 }
@@ -183,6 +185,13 @@ async function checkRentDue() {
     const t = roomTotals[normRoomKey(a.name)];
     return !!t && (t.received + t.repairOffset) >= a.rent;
   };
+
+  // ซิงก์ "สถานะการชำระ" ในสัญญาทุกวัน ให้ตรงกับ Income DB จริง — ไม่ใช่แค่ตอนสลิปเข้าใหม่
+  // เผื่อกรณีจ่ายไม่ครบ (sync ทันทีตอนรับสลิปมองโลกในแง่ดีไปก่อน) และคืนค่าเป็น "รอชำระ" อัตโนมัติทุกต้นเดือนเพราะ roomTotals คำนวณจากเดือนปัจจุบันเท่านั้น
+  for (const a of assets) {
+    const status = isPaid(a) ? 'ชำระแล้ว' : (day > a.dueDay ? 'ค้างชำระ' : 'รอชำระ');
+    await syncContractPaymentStatus(a.contractPageId, status);
+  }
 
   // ห้องที่ติ๊ก "ใช้บอทขุนทองอยู่แล้ว" ข้ามไปเลย กันแจ้งซ้ำซ้อนกับอีกบอท
   // day > dueDay (ไม่ใช่ >=) เพราะหลายสัญญามี grace period ในตัว (เช่น "ชำระภายในวันที่ 1-4") — วันครบกำหนดพอดียังไม่ถือว่าค้างชำระ
@@ -267,13 +276,19 @@ async function handleEvent(event) {
     const data = event.postback.data || '';
     const to   = event.source.groupId || event.source.roomId || event.source.userId;
     if (data.startsWith('confirm_room|')) {
-      const [, pageId, roomNameEnc] = data.split('|');
+      const [, kind, pageId, roomNameEnc] = data.split('|');
       const roomName = decodeURIComponent(roomNameEnc);
       try {
         await axios.patch(`https://api.notion.com/v1/pages/${pageId}`,
           { properties: { 'ห้อง / ทรัพย์สิน': { rich_text: [{ text: { content: roomName } }] } } },
           { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
         );
+        // แค่ค่าเช่าเท่านั้นที่ยืนยันห้องแล้วถือว่า "ชำระแล้ว" — ใบเสร็จซ่อมไม่ใช่การจ่ายค่าเช่า ไม่ควรไปทับสถานะการชำระ
+        if (kind === 'rent') {
+          const assets = await fetchAssetsWithContracts();
+          const room = assets.find(a => a.name === roomName);
+          if (room) await syncContractPaymentStatus(room.contractPageId, 'ชำระแล้ว');
+        }
         await push(to, `✅ ยืนยันแล้วครับ บันทึกเป็นห้อง ${roomName}`);
       } catch (err) {
         console.error('Confirm-room ERR:', err.response?.data || err.message);
@@ -417,10 +432,11 @@ async function handleEvent(event) {
 
     if (matched) {
       msg += `\n🏠 ห้อง: ${matched.name}\n📝 บันทึก Notion เรียบร้อยแล้วครับ`;
+      await syncContractPaymentStatus(matched.contractPageId, 'ชำระแล้ว');
       await push(to, msg);
     } else {
       msg += `\n❓ ไม่พบห้องที่ตรงกับยอดชัดเจน กดยืนยันห้องด้านล่างนี้ได้เลยครับ\n📝 บันทึกไว้ชั่วคราวแล้ว`;
-      await pushRoomConfirm(to, msg, createRes.data.id, candidates);
+      await pushRoomConfirm(to, msg, createRes.data.id, candidates, 'rent');
     }
 
   } catch (err) {
@@ -487,19 +503,19 @@ async function handleRepairReceipt(doc, to) {
     await push(to, msg);
   } else {
     msg += `\n❓ ไม่พบห้องที่ตรงกับกลุ่มนี้ชัดเจน กดยืนยันห้องด้านล่างนี้ได้เลยครับ\n📝 บันทึกไว้ชั่วคราวแล้ว`;
-    await pushRoomConfirm(to, msg, createRes.data.id, candidates);
+    await pushRoomConfirm(to, msg, createRes.data.id, candidates, 'repair');
   }
 }
 
 // ส่งข้อความพร้อมปุ่ม quick reply ให้กดยืนยันห้อง — แต่ละปุ่มเป็น postback คู่กับ pageId ของรายการที่สร้างไว้แล้ว
 // เพื่อให้กดแล้วไปแก้ property ห้องของรายการเดิม ไม่ใช่สร้างรายการใหม่ซ้อน
-async function pushRoomConfirm(to, text, pageId, candidates) {
+async function pushRoomConfirm(to, text, pageId, candidates, kind) {
   const items = candidates.slice(0, 13).map(a => ({
     type: 'action',
     action: {
       type: 'postback',
       label: a.name.slice(0, 20),
-      data: `confirm_room|${pageId}|${encodeURIComponent(a.name)}`,
+      data: `confirm_room|${kind}|${pageId}|${encodeURIComponent(a.name)}`,
       displayText: `ยืนยันห้อง ${a.name}`
     }
   }));
@@ -509,6 +525,20 @@ async function pushRoomConfirm(to, text, pageId, candidates) {
     { to, messages },
     { headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' } }
   );
+}
+
+// อัปเดต "สถานะการชำระ" ในสัญญาให้ตรงกับความจริง — ฟิลด์นี้แต่ก่อนตั้งเป็น "รอชำระ" ตอนสร้างสัญญาแล้วไม่มีอะไรอัปเดตอีกเลย
+// ทำให้หน้า Notion สัญญาเช่าไม่เคยสะท้อนว่าเดือนนี้จ่ายแล้วหรือยัง ทั้งที่ Income DB มีรายการจริงอยู่
+async function syncContractPaymentStatus(contractPageId, status) {
+  if (!contractPageId) return;
+  try {
+    await axios.patch(`https://api.notion.com/v1/pages/${contractPageId}`,
+      { properties: { 'สถานะการชำระ': { select: { name: status } } } },
+      { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
+    );
+  } catch (err) {
+    console.error('syncContractPaymentStatus ERR:', contractPageId, status, err.response?.data || err.message);
+  }
 }
 
 app.listen(PORT, () => console.log(`LeaseAI Bot port ${PORT}`));
