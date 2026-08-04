@@ -335,11 +335,21 @@ async function handleEvent(event) {
 
     const assets = await fetchAssetsWithContracts();
 
-    // จับคู่ห้อง เรียงตามความน่าเชื่อถือ: 1) กลุ่มไลน์ของห้องนั้นเอง (ตั้งไว้ใน Contract DB — แม่นสุดเพราะรู้แน่ว่าใครส่งมาจากกลุ่มไหน)
+    // จับคู่ห้อง เรียงตามความน่าเชื่อถือ: 1) กลุ่มไลน์ของห้องนั้นเอง (ตั้งไว้ใน Contract DB) — แต่ยังต้องเช็คว่ายอด/ชื่อผู้โอนสมเหตุสมผลกับผู้เช่าห้องนั้นด้วย
+    // ไม่ใช่เชื่อกลุ่มอย่างเดียว เพราะมีเคสที่ภาพซึ่งไม่ใช่ค่าเช่าห้องนั้นจริงถูกส่งเข้ากลุ่มผิด (คนละชื่อคนละยอดกับผู้เช่าห้องนั้นเลย) แล้วบอทเชื่อกลุ่มเฉยๆจนบันทึกผิดห้อง
     // 2) โน้ตในสลิปที่ระบุห้องตรงๆ 3) ชื่อผู้เช่า 4) ยอดเงินตรงเป๊ะเท่านั้น
     // ไม่เดาจาก "ยอดใกล้เคียง" อีกต่อไป — เคยจับผิดห้องเวลาผู้เช่าหักค่าใช้จ่ายอื่นออกจากยอดโอนแล้วยอดไปใกล้ห้องอื่นโดยบังเอิญ
     // ถ้ายังจับคู่ไม่ได้ชัดเจน (ไม่เจอเลย หรือเจอมากกว่า 1 ห้องพอดี) ส่ง quick reply ให้กดยืนยันเอง ดีกว่าเดาแล้วผิดแบบไม่มีใครสังเกต
-    let matched = assets.find(a => a.tenantGroupId && a.tenantGroupId === to) || null;
+    let matched = null;
+    const groupRoom = assets.find(a => a.tenantGroupId && a.tenantGroupId === to) || null;
+    if (groupRoom) {
+      const sameRent = slip.amount != null && groupRoom.rent === slip.amount;
+      const sn = slip.sender_name ? normName(slip.sender_name) : '';
+      const tn = groupRoom.tenant ? normName(groupRoom.tenant) : '';
+      const sameSender = !!(sn && tn && (sn.includes(tn) || tn.includes(sn)));
+      if (sameRent || sameSender) matched = groupRoom;
+      // ถ้ายอดและชื่อผู้โอนไม่ตรงกับผู้เช่าห้องที่กลุ่มนี้ผูกไว้เลยสักอย่าง ปล่อยผ่านไปให้ขั้นตอนอื่นข้างล่างจับคู่ต่อแทนที่จะเชื่อกลุ่มอย่างเดียว
+    }
     let candidates = [];
     if (!matched && slip.memo) {
       const memoKey = normRoomKey(slip.memo);
