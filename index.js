@@ -165,16 +165,28 @@ async function checkRentDue() {
     startCursor = iRes.data.has_more ? iRes.data.next_cursor : undefined;
   } while (startCursor);
 
+  // รวมยอดต่อห้องแทนการเช็คแค่ "มีรายการไหม" — ผู้เช่าบางคนหักค่าซ่อมที่จ่ายเองออกจากค่าเช่าตรงๆ แล้วส่งใบเสร็จค่าซ่อมแยกมาต่างหาก
+  // ถือว่าจ่ายครบถ้า (ค่าเช่าที่ได้รับจริง + ค่าซ่อมที่ห้องนั้นสำรองจ่ายไปในเดือนเดียวกัน) >= ค่าเช่าเต็ม ไม่ใช่แค่เช็คว่ามีรายการห้องนั้นโผล่มาหรือเปล่า
   // เทียบด้วย normRoomKey แทน exact match กันเคสพิมพ์ชื่อห้องใน Income DB เพี้ยนจาก AssetLiving DB นิดหน่อย (ช่องว่าง/ตัวพิมพ์) แล้วระบบมองว่ายังไม่จ่าย ทั้งที่จ่ายแล้ว
-  const paidRoomKeys = new Set(
-    incomeResults
-      .map(p => normRoomKey(p.properties['ห้อง / ทรัพย์สิน']?.rich_text?.[0]?.plain_text))
-      .filter(Boolean)
-  );
+  const roomTotals = {};
+  for (const p of incomeResults) {
+    const roomKey = normRoomKey(p.properties['ห้อง / ทรัพย์สิน']?.rich_text?.[0]?.plain_text);
+    if (!roomKey) continue;
+    const amount   = p.properties['จำนวนเงิน (บาท)']?.number || 0;
+    const type     = p.properties['ประเภท']?.select?.name;
+    const category = p.properties['หมวดหมู่']?.select?.name;
+    if (!roomTotals[roomKey]) roomTotals[roomKey] = { received: 0, repairOffset: 0 };
+    if (type === 'รายรับ' && category === 'ค่าเช่า')       roomTotals[roomKey].received += amount;
+    else if (type === 'รายจ่าย' && category === 'ซ่อมแซม') roomTotals[roomKey].repairOffset += amount;
+  }
+  const isPaid = a => {
+    const t = roomTotals[normRoomKey(a.name)];
+    return !!t && (t.received + t.repairOffset) >= a.rent;
+  };
 
   // ห้องที่ติ๊ก "ใช้บอทขุนทองอยู่แล้ว" ข้ามไปเลย กันแจ้งซ้ำซ้อนกับอีกบอท
   // day > dueDay (ไม่ใช่ >=) เพราะหลายสัญญามี grace period ในตัว (เช่น "ชำระภายในวันที่ 1-4") — วันครบกำหนดพอดียังไม่ถือว่าค้างชำระ
-  const overdue = assets.filter(a => day > a.dueDay && !paidRoomKeys.has(normRoomKey(a.name)) && !a.skipReminder);
+  const overdue = assets.filter(a => day > a.dueDay && !isPaid(a) && !a.skipReminder);
   summary.overdueRooms = overdue.map(a => a.name);
   if (!overdue.length) return summary;
 
@@ -295,25 +307,29 @@ async function handleEvent(event) {
           role: 'user',
           content: [
             { type: 'image', source: { type: 'base64', media_type: mime, data: b64 } },
-            { type: 'text', text: `อ่านสลิปโอนเงินธนาคารไทยนี้ให้ละเอียดที่สุด อ่านข้อความทุกส่วนที่ปรากฏในภาพ รวมถึงข้อความบันทึกช่วยจำ/โน้ตที่ผู้โอนอาจพิมพ์แนบไว้ (ถ้ามี) แล้วตอบ JSON เท่านั้น ห้ามมี markdown:
-{"sender_name":string_or_null,"amount":number_or_null,"date":"YYYY-MM-DD"_or_null,"time":string_or_null,"ref_number":string_or_null,"bank_from":string_or_null,"bank_to":string_or_null,"memo":string_or_null,"is_slip":boolean}
+            { type: 'text', text: `อ่านภาพนี้ให้ละเอียดที่สุด ภาพอาจเป็น (1) สลิปโอนเงินธนาคารไทยที่ผู้เช่าโอนค่าเช่า หรือ (2) ใบเสร็จ/บิล/ใบแจ้งหนี้ค่าซ่อมแซมที่ผู้เช่าสำรองจ่ายเอง แล้วตอบ JSON เท่านั้น ห้ามมี markdown:
+{"doc_type":"rent_slip"_or_"repair_receipt"_or_"other","sender_name":string_or_null,"amount":number_or_null,"date":"YYYY-MM-DD"_or_null,"time":string_or_null,"ref_number":string_or_null,"bank_from":string_or_null,"bank_to":string_or_null,"memo":string_or_null,"repair_description":string_or_null}
 
 กติกาสำคัญ:
-1. memo คือข้อความบันทึกช่วยจำ/หมายเหตุที่ผู้โอนพิมพ์เอง (ถ้ามี) เช่น "ค่าเช่าห้อง 841" หรือชื่อห้อง/เลขห้อง — อ่านให้ครบทุกตัวอักษรที่เห็น ถ้าไม่มีข้อความแบบนี้ในสลิปให้ตอบ null
-2. วันที่บนสลิปธนาคารไทยเป็นรูปแบบ วัน/เดือน/ปี (DD/MM/YYYY) เสมอ ห้ามอ่านสลับเป็นเดือน/วัน (MM/DD) แบบสากลอเมริกันเด็ดขาด เช่น 01/07/2569 หมายถึงวันที่ 1 เดือนกรกฎาคม ไม่ใช่วันที่ 1 เดือนมกราคม
-3. ฟิลด์ date ต้องเป็นปีคริสต์ศักราช (ค.ศ.) เสมอ ถ้าวันที่ในสลิปแสดงเป็นปีพุทธศักราช (พ.ศ., ปกติจะเป็นเลข 25xx เช่น 2569) ให้แปลงเป็น ค.ศ. โดยลบ 543 ก่อนตอบ (เช่น พ.ศ. 2569 → ค.ศ. 2026) ห้ามตอบเลขปีพ.ศ.ตรงๆ โดยเด็ดขาด
-4. is_slip ต้องเป็น true เฉพาะภาพที่เป็น "สลิปโอนเงินจากผู้เช่าเข้าบัญชีเจ้าของห้อง/นิติบุคคล เพื่อจ่ายค่าเช่า" เท่านั้น ถ้าเป็นภาพอื่นที่ไม่ใช่การโอนเงินเข้าเพื่อจ่ายค่าเช่าโดยตรง เช่น หน้าจอยืนยันชำระค่าไฟ (MEA/PEA/กฟน./กฟภ./MEA Connect), ค่าน้ำ, เติมเงินมือถือ, ชำระบัตรเครดิต, ใบเสร็จซื้อของ, หรือรายการที่เจ้าของห้องเป็นฝ่ายจ่ายเงินออกเอง (ไม่ใช่ผู้เช่าโอนเข้ามา) ให้ตอบ is_slip เป็น false เสมอ แม้ภาพนั้นจะมีเครื่องหมายถูก/คำว่า "สำเร็จ"/"ยืนยัน" ก็ตาม` }
+1. doc_type = "rent_slip" เฉพาะภาพที่เป็น "สลิปโอนเงินจากผู้เช่าเข้าบัญชีเจ้าของห้อง/นิติบุคคล เพื่อจ่ายค่าเช่า" เท่านั้น
+2. doc_type = "repair_receipt" สำหรับใบเสร็จ/บิล/ใบแจ้งหนี้ค่าซ่อมแซม-ซ่อมบำรุงที่ผู้เช่าเป็นคนจ่ายเอง (เช่น ช่างซ่อมท่อน้ำ, ซ่อมแอร์, เปลี่ยนหลอดไฟ) — amount คือยอดรวมทั้งบิล, repair_description คือรายละเอียดว่าซ่อมอะไร (สรุปจากหัวบิล/รายการในใบเสร็จ)
+3. doc_type = "other" สำหรับภาพอื่นทั้งหมดที่ไม่เข้าเกณฑ์ข้อ 1-2 เช่น หน้าจอยืนยันชำระค่าไฟ (MEA/PEA/กฟน./กฟภ./MEA Connect), ค่าน้ำ, เติมเงินมือถือ, ชำระบัตรเครดิต, ใบเสร็จซื้อของทั่วไปที่ไม่ใช่ค่าซ่อม, หรือรายการที่เจ้าของห้องเป็นฝ่ายจ่ายเงินออกเอง แม้ภาพนั้นจะมีเครื่องหมายถูก/คำว่า "สำเร็จ"/"ยืนยัน" ก็ตาม
+4. memo (เฉพาะตอน doc_type เป็น rent_slip) คือข้อความบันทึกช่วยจำ/หมายเหตุที่ผู้โอนพิมพ์เอง (ถ้ามี) เช่น "ค่าเช่าห้อง 841" หรือชื่อห้อง/เลขห้อง — อ่านให้ครบทุกตัวอักษรที่เห็น ถ้าไม่มีข้อความแบบนี้ให้ตอบ null
+5. วันที่บนสลิป/ใบเสร็จไทยเป็นรูปแบบ วัน/เดือน/ปี (DD/MM/YYYY) เสมอ ห้ามอ่านสลับเป็นเดือน/วัน (MM/DD) แบบสากลอเมริกันเด็ดขาด เช่น 01/07/2569 หมายถึงวันที่ 1 เดือนกรกฎาคม ไม่ใช่วันที่ 1 เดือนมกราคม
+6. ฟิลด์ date ต้องเป็นปีคริสต์ศักราช (ค.ศ.) เสมอ ถ้าวันที่ในภาพแสดงเป็นปีพุทธศักราช (พ.ศ., ปกติจะเป็นเลข 25xx เช่น 2569) ให้แปลงเป็น ค.ศ. โดยลบ 543 ก่อนตอบ (เช่น พ.ศ. 2569 → ค.ศ. 2026) ห้ามตอบเลขปีพ.ศ.ตรงๆ โดยเด็ดขาด` }
           ]
         }]
       },
       { headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' } }
     );
 
-    const raw  = aiRes.data.content[0].text.trim().replace(/```json|```/g, '').trim();
-    const slip = JSON.parse(raw);
-    console.log('Slip:', slip);
+    const raw = aiRes.data.content[0].text.trim().replace(/```json|```/g, '').trim();
+    const doc = JSON.parse(raw);
+    console.log('Doc:', doc);
 
-    if (!slip.is_slip) { console.log('ไม่ใช่สลิป — ไม่ตอบกลับ'); return; }
+    if (doc.doc_type === 'repair_receipt') { await handleRepairReceipt(doc, to); return; }
+    if (doc.doc_type !== 'rent_slip') { console.log('ไม่ใช่สลิปหรือใบเสร็จซ่อม — ไม่ตอบกลับ'); return; }
+    const slip = doc;
 
     const fixedDate = normalizeSlipDate(slip.date);
     if (fixedDate && fixedDate !== slip.date) console.log('Date corrected:', slip.date, '->', fixedDate);
@@ -428,6 +444,51 @@ async function push(to, text) {
     { to, messages: [{ type: 'text', text }] },
     { headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' } }
   );
+}
+
+// ผู้เช่าสำรองจ่ายค่าซ่อมเองแล้วหักออกจากค่าเช่าที่โอนมา — บันทึกเป็นรายจ่าย "ซ่อมแซม" ของห้องนั้น
+// checkRentDue() จะรวมยอดนี้เข้ากับค่าเช่าที่ได้รับจริง ถ้ารวมกันครบเท่าค่าเช่าเต็มก็ถือว่าเดือนนั้นจ่ายครบ ไม่เตือนซ้ำ
+async function handleRepairReceipt(doc, to) {
+  const fixedDate  = normalizeSlipDate(doc.date);
+  const recordDate = fixedDate || doc.date || new Date().toISOString().slice(0, 10);
+  const monthKey   = recordDate.slice(0, 7);
+  await ensureMonthOption(monthKey);
+
+  const assets  = await fetchAssetsWithContracts();
+  const matched = assets.find(a => a.tenantGroupId && a.tenantGroupId === to) || null;
+  const candidates = matched ? [] : assets.slice(0, 13);
+
+  const amount = doc.amount || 0;
+  const desc   = doc.repair_description || 'ค่าซ่อมแซม';
+  const title  = matched ? `ซ่อมแซม ${matched.name} ${recordDate}` : `ซ่อมแซม ${desc}`;
+  const body = {
+    parent: { database_id: NOTION_INCOME_DB },
+    properties: {
+      'รายการ':           { title: [{ text: { content: title } }] },
+      'ประเภท':            { select: { name: 'รายจ่าย' } },
+      'หมวดหมู่':          { select: { name: 'ซ่อมแซม' } },
+      'จำนวนเงิน (บาท)':  { number: amount },
+      'สถานะ':             { select: { name: 'เสร็จสิ้น' } },
+      'วันที่':            { date: { start: recordDate } },
+      'รอบเดือน':          { select: { name: monthKey } },
+      'หมายเหตุ':          { rich_text: [{ text: { content: `${desc} — ผู้เช่าสำรองจ่ายเอง (หักจากค่าเช่า)` } }] },
+    }
+  };
+  if (matched) body.properties['ห้อง / ทรัพย์สิน'] = { rich_text: [{ text: { content: matched.name } }] };
+
+  const createRes = await axios.post('https://api.notion.com/v1/pages', body,
+    { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
+  );
+
+  const amt = amount ? `฿${amount.toLocaleString()}` : '?';
+  let msg = `🛠️ รับใบเสร็จค่าซ่อมแล้วครับ\n━━━━━━━━━━━━━━\n💰 ยอด: ${amt}\n📝 รายการ: ${desc}\n📅 วันที่: ${recordDate}\n`;
+  if (matched) {
+    msg += `\n🏠 ห้อง: ${matched.name}\n📝 บันทึกเป็นรายจ่ายซ่อมแซมแล้วครับ — ถ้ายอดค่าเช่าที่โอนมา + ค่าซ่อมนี้รวมกันครบค่าเช่าเต็ม จะถือว่าเดือนนี้จ่ายครบแล้ว`;
+    await push(to, msg);
+  } else {
+    msg += `\n❓ ไม่พบห้องที่ตรงกับกลุ่มนี้ชัดเจน กดยืนยันห้องด้านล่างนี้ได้เลยครับ\n📝 บันทึกไว้ชั่วคราวแล้ว`;
+    await pushRoomConfirm(to, msg, createRes.data.id, candidates);
+  }
 }
 
 // ส่งข้อความพร้อมปุ่ม quick reply ให้กดยืนยันห้อง — แต่ละปุ่มเป็น postback คู่กับ pageId ของรายการที่สร้างไว้แล้ว
