@@ -36,6 +36,18 @@ function normalizeSlipDate(dateStr) {
   return `${y}-${mo}-${d}`;
 }
 
+// หา "รอบเดือน" ที่สลิปนี้ควรนับเข้า — เทียบระยะห่างจริง (วัน) จากวันโอนไปยังวันครบชำระของเดือนนี้ กับของเดือนหน้า แล้วเลือกอันที่ใกล้กว่า
+// (เดิมใช้แค่ "วันที่โอน (ตัวเลขวันในเดือน) > วันครบชำระ ก็ชิฟไปเดือนหน้าเลย" ซึ่งพังทันทีถ้าวันครบชำระอยู่ปลายเดือน เช่น 23 — โอนวันที่ 24 (ช้าไปแค่ 1 วันของเดือนนี้)
+// จะถูกเข้าใจผิดว่าจ่ายล่วงหน้าให้เดือนหน้า ทำให้ Income DB เดือนนี้ไม่เห็นรายการจ่าย และ cron ทวงซ้ำทั้งที่จ่ายแล้ว — ดูตัวอย่างเคสห้อง 464/8 ที่แก้บั๊กนี้)
+function resolveCycleMonth(recordDate, dueDay) {
+  const d = new Date(recordDate + 'T00:00:00Z');
+  if (!dueDay) return recordDate.slice(0, 7);
+  const dueThisMonth = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), dueDay));
+  const dueNextMonth = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, dueDay));
+  const target = Math.abs(dueNextMonth - d) < Math.abs(d - dueThisMonth) ? dueNextMonth : dueThisMonth;
+  return target.toISOString().slice(0, 7);
+}
+
 // จับคู่ห้อง — ราคาที่ AssetLiving เก็บไว้ใช้โชว์เอเจนต์ อาจไม่ตรงค่าเช่าจริง และหลายห้องราคาซ้ำกัน
 // จับคู่ตามสัญญาจริง (Contract DB) แทน โดยพยายามจับชื่อผู้เช่าก่อน แล้วค่อย fallback เป็นยอดเงิน
 function normRoomKey(s) {
@@ -505,16 +517,9 @@ async function handleEvent(event) {
     const recordDate = slip.date || new Date().toISOString().slice(0, 10);
     body.properties['วันที่'] = { date: { start: recordDate } };
 
-    // ค่าเช่าจ่ายล่วงหน้าเสมอ (จ่ายก่อนเข้าอยู่เดือนถัดไป ไม่ใช่จ่ายย้อนหลังของเดือนที่อยู่แล้ว) — ถ้าวันที่โอนเลยวันครบชำระของห้องนั้นในเดือนนั้นไปแล้ว
-    // แปลว่ากำลังจ่ายล่วงหน้าให้เดือนถัดไป เช่น ห้องครบชำระทุกวันที่ 1 โอนวันที่ 31 ก.ค. คือค่าเช่าเดือนสิงหาคม ไม่ใช่กรกฎาคม
-    let cycleMonth = recordDate.slice(0, 7);
-    if (matched && matched.dueDay) {
-      const d = new Date(recordDate + 'T00:00:00Z');
-      if (d.getUTCDate() > matched.dueDay) {
-        d.setUTCMonth(d.getUTCMonth() + 1);
-        cycleMonth = d.toISOString().slice(0, 7);
-      }
-    }
+    // ค่าเช่าจ่ายล่วงหน้าเสมอ (จ่ายก่อนเข้าอยู่เดือนถัดไป ไม่ใช่จ่ายย้อนหลังของเดือนที่อยู่แล้ว) — เลือกรอบเดือนที่ "วันครบชำระ" ใกล้วันที่โอนที่สุด (ดู resolveCycleMonth)
+    // เช่น ห้องครบชำระทุกวันที่ 1 โอนวันที่ 31 ก.ค. คือค่าเช่าเดือนสิงหาคม (ใกล้วันครบชำระ 1 ส.ค. กว่า) ไม่ใช่กรกฎาคม
+    let cycleMonth = matched ? resolveCycleMonth(recordDate, matched.dueDay) : recordDate.slice(0, 7);
     await ensureMonthOption(cycleMonth);
     body.properties['รอบเดือน'] = { select: { name: cycleMonth } };
     // ตั้งชื่อ "รายการ" ด้วยรอบเดือน (ไม่ใช่วันที่โอนดิบๆ) ให้ตรงกับคอลัมน์ที่มันจะไปอยู่ในมุมมองแยกตามเดือนเสมอ — กันสับสนเวลาสลิปจ่ายล่วงหน้าข้ามเดือน
@@ -523,6 +528,25 @@ async function handleEvent(event) {
       body.properties['ห้อง / ทรัพย์สิน'] = { rich_text: [{ text: { content: matched.name } }] };
     }
     if (slip.ref_number)  body.properties['เลขอ้างอิง'] = { rich_text: [{ text: { content: slip.ref_number } }] };
+
+    // กันซ้ำอีกชั้น เผื่อ AI อ่านเลขอ้างอิงจากสลิปใบเดียวกันเพี้ยนไปคนละตัวระหว่างสองครั้ง (เจอจริงกับห้อง 464/8 — เลขอ้างอิงต่างกันแค่ 1 หลัก)
+    // ทำให้ตัวกันซ้ำด้วยเลขอ้างอิงตรงเป๊ะด้านบนจับไม่ได้ — เช็คซ้ำด้วย ห้อง+ยอด+วันที่+รอบเดือน แทน ถ้าเจอรายการเดิมอยู่แล้วไม่สร้างซ้อน
+    if (matched) {
+      const dupRes2 = await axios.post(
+        `https://api.notion.com/v1/databases/${NOTION_INCOME_DB}/query`,
+        { page_size: 1, filter: { and: [
+          { property: 'ห้อง / ทรัพย์สิน', rich_text: { equals: matched.name } },
+          { property: 'จำนวนเงิน (บาท)', number: { equals: slip.amount || 0 } },
+          { property: 'วันที่', date: { equals: recordDate } },
+          { property: 'หมวดหมู่', select: { equals: 'ค่าเช่า' } },
+        ] } },
+        { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
+      );
+      if (dupRes2.data.results.length) {
+        await push(to, `⚠️ ดูเหมือนสลิปนี้บันทึกไปแล้วก่อนหน้านี้ครับ (ห้อง ${matched.name}, ยอด ${slip.amount ? '฿'+slip.amount.toLocaleString() : '-'}, วันที่ ${recordDate}) ไม่ได้บันทึกซ้ำให้นะครับ ถ้าเป็นคนละรายการจริงรบกวนแจ้งเจ้าของห้องตรวจสอบด้วยครับ`);
+        return;
+      }
+    }
 
     const createRes = await axios.post('https://api.notion.com/v1/pages', body,
       { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
