@@ -178,8 +178,8 @@ async function checkRentDue() {
     overdueRooms: [],
     directSent: [],
     directFailed: [],
-    fallbackSent: false,
-    fallbackSkippedReason: null,
+    mainSummarySent: false,
+    mainSummarySkippedReason: null,
   };
 
   const assets = (await fetchAssetsWithContracts()).filter(a => a.dueDay);
@@ -239,16 +239,14 @@ async function checkRentDue() {
     await syncContractPaymentStatus(a.contractPageId, status);
   }
 
-  // ห้องที่ติ๊ก "ใช้บอทขุนทองอยู่แล้ว" ข้ามไปเลย กันแจ้งซ้ำซ้อนกับอีกบอท
   // day > dueDay (ไม่ใช่ >=) เพราะหลายสัญญามี grace period ในตัว (เช่น "ชำระภายในวันที่ 1-4") — วันครบกำหนดพอดียังไม่ถือว่าค้างชำระ
-  const overdue = assets.filter(a => day > a.dueDay && !isPaid(a) && !a.skipReminder);
-  summary.overdueRooms = overdue.map(a => a.name);
-  if (!overdue.length) return summary;
+  // ไม่กรอง skipReminder ออกตรงนี้แล้ว — ห้องที่ใช้บอทขุนทองอยู่แล้วยังต้องโผล่ในสรุปห้องค้างชำระที่กลุ่มหลัก (ข้อ 4) แค่ไม่ส่งทวงตรงเข้ากลุ่มห้อง (ข้อ 3) ซ้ำกับขุนทองเท่านั้น
+  const allOverdue = assets.filter(a => day > a.dueDay && !isPaid(a));
+  summary.overdueRooms = allOverdue.map(a => a.name);
+  if (!allOverdue.length) return summary;
 
-  // ห้องที่มี LINE Group ID ของตัวเอง -> ทวงตรงเข้ากลุ่มผู้เช่าคนนั้นเลย
-  // ห้องที่ยังไม่ได้ตั้ง Group ID ไว้ -> รวมเป็นสรุปเดียวส่งเข้ากลุ่มหลัก กันตกหล่น
-  const direct = overdue.filter(a => a.tenantGroupId);
-  const fallback = overdue.filter(a => !a.tenantGroupId);
+  // ห้องที่มี LINE Group ID ของตัวเอง และไม่ได้ใช้บอทขุนทองอยู่แล้ว -> ทวงตรงเข้ากลุ่มผู้เช่าคนนั้นด้วย (นอกเหนือจากสรุปที่กลุ่มหลักด้านล่าง)
+  const direct = allOverdue.filter(a => a.tenantGroupId && !a.skipReminder);
 
   for (const a of direct) {
     const msg = `🔔 แจ้งเตือนค่าเช่าค้างชำระ\n━━━━━━━━━━━━━━\n🏠 ห้อง: ${a.name}\n💰 ค่าเช่า: ฿${a.rent.toLocaleString()}\n📅 ครบกำหนดชำระทุกวันที่ ${a.dueDay}\n\nรบกวนโอนค่าเช่าและส่งสลิปเข้ากลุ่มนี้ได้เลยครับ ขอบคุณครับ 🙏`;
@@ -263,24 +261,16 @@ async function checkRentDue() {
     }
   }
 
-  if (!fallback.length) {
-    // nothing to do
-  } else if (!LINE_GROUP_ID) {
-    summary.fallbackSkippedReason = 'LINE_GROUP_ID env var is not set (empty/undefined)';
-    summary.fallbackRooms = fallback.map(a => a.name);
+  // สรุปห้องค้างชำระทั้งหมดส่งเข้ากลุ่มหลักเสมอ (นับเป็น "X จาก Y ห้อง" ไม่อิงเดือนปฏิทิน เพราะแต่ละห้องครบชำระคนละวัน)
+  // รวมห้องที่มีกลุ่มตัวเองและห้องขุนทองด้วย ไม่ใช่แค่ห้องที่ยังไม่มีกลุ่ม — ให้เจ้าของเห็นภาพรวมทุกห้องในที่เดียว พร้อมปุ่มติ๊กว่าชำระแล้วเผื่อจ่ายผ่านช่องทางอื่นหรือลืมส่งสลิป
+  if (!LINE_GROUP_ID) {
+    summary.mainSummarySkippedReason = 'LINE_GROUP_ID env var is not set (empty/undefined)';
   } else {
-    const lines = fallback.map(a => `• ${a.name} — ${a.tenant || 'ไม่ระบุผู้เช่า'} (ครบกำหนดวันที่ ${a.dueDay}, ค่าเช่า ฿${a.rent.toLocaleString()})`);
-    const msg = `🔔 แจ้งเตือนค่าเช่าค้างชำระ (ยังไม่ได้ตั้งกลุ่มผู้เช่า) (${today.toLocaleDateString('th-TH')})\n━━━━━━━━━━━━━━\n${lines.join('\n')}`;
     try {
-      await axios.post('https://api.line.me/v2/bot/message/push',
-        { to: LINE_GROUP_ID, messages: [{ type: 'text', text: msg }] },
-        { headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' } }
-      );
-      summary.fallbackSent = true;
-      summary.fallbackRooms = fallback.map(a => a.name);
+      await pushOverdueChecklist(LINE_GROUP_ID, allOverdue, assets.length);
+      summary.mainSummarySent = true;
     } catch (err) {
-      summary.fallbackSkippedReason = 'push failed: ' + JSON.stringify(err.response?.data || err.message);
-      summary.fallbackRooms = fallback.map(a => a.name);
+      summary.mainSummarySkippedReason = 'push failed: ' + JSON.stringify(err.response?.data || err.message);
     }
   }
 
@@ -388,6 +378,43 @@ async function handleEvent(event) {
         await push(to, `✅ บันทึกส่วนต่าง ฿${shortfall.toLocaleString()} เป็น${category}แล้วครับ ตอนนี้ห้อง ${roomName} ครบค่าเช่าเดือน ${monthKey} แล้ว`);
       } catch (err) {
         console.error('deduct_shortfall ERR:', err.response?.data || err.message);
+        await push(to, `❌ บันทึกไม่สำเร็จ: ${err.message}`).catch(()=>{});
+      }
+    }
+
+    // เจ้าของ/ผู้ดูแลกดติ๊กจากสรุปค้างชำระที่กลุ่มหลัก (pushOverdueChecklist) ว่าห้องนี้จ่ายแล้วจริง — เผื่อจ่ายผ่านช่องทางอื่นหรือลืมส่งสลิปเข้าบอท
+    // ต้องสร้างรายการรับใน Income DB ด้วย (ไม่ใช่แค่แก้ "สถานะการชำระ") เพราะ checkRentDue() ตัดสินค้างชำระจากยอดจริงใน Income DB เท่านั้น
+    // ถ้าแก้แค่สถานะเฉยๆ พรุ่งนี้ cron จะคำนวณ isPaid() ใหม่จาก Income DB แล้วเจอว่ายังไม่จ่าย ทวงซ้ำอีกเหมือนเดิม
+    if (data.startsWith('mark_paid|')) {
+      const [, contractPageId, roomNameEnc] = data.split('|');
+      const roomName = decodeURIComponent(roomNameEnc);
+      try {
+        const assets = await fetchAssetsWithContracts();
+        const room = assets.find(a => a.contractPageId === contractPageId);
+        if (!room) { await push(to, `❌ ไม่พบห้อง ${roomName} แล้วครับ`); return; }
+
+        const todayStr = new Date().toISOString().slice(0, 10);
+        const cycleMonth = resolveCycleMonth(todayStr, room.dueDay);
+        await ensureMonthOption(cycleMonth);
+        await axios.post('https://api.notion.com/v1/pages', {
+          parent: { database_id: NOTION_INCOME_DB },
+          properties: {
+            'รายการ':           { title: [{ text: { content: `ค่าเช่า ${room.name} ${cycleMonth}` } }] },
+            'ประเภท':            { select: { name: 'รายรับ' } },
+            'หมวดหมู่':          { select: { name: 'ค่าเช่า' } },
+            'จำนวนเงิน (บาท)':  { number: room.rent },
+            'สถานะ':             { select: { name: 'เสร็จสิ้น' } },
+            'วันที่':            { date: { start: todayStr } },
+            'รอบเดือน':          { select: { name: cycleMonth } },
+            'ห้อง / ทรัพย์สิน':  { rich_text: [{ text: { content: room.name } }] },
+            'หมายเหตุ':          { rich_text: [{ text: { content: 'ติ๊กยืนยันชำระแล้วด้วยตนเองจากสรุปกลุ่มหลัก — ไม่มีสลิปแนบ' } }] },
+          }
+        }, { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } });
+
+        await syncContractPaymentStatus(room.contractPageId, 'ชำระแล้ว');
+        await push(to, `✅ ติ๊กห้อง ${room.name} เป็นชำระแล้วเรียบร้อยครับ`);
+      } catch (err) {
+        console.error('mark_paid ERR:', err.response?.data || err.message);
         await push(to, `❌ บันทึกไม่สำเร็จ: ${err.message}`).catch(()=>{});
       }
     }
@@ -669,6 +696,29 @@ async function pushShortfallConfirm(to, text, roomName, monthKey) {
   ];
   await axios.post('https://api.line.me/v2/bot/message/push',
     { to, messages: [{ type: 'text', text, quickReply: { items } }] },
+    { headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' } }
+  );
+}
+
+// สรุปห้องค้างชำระทั้งหมดส่งเข้ากลุ่มหลัก นับเป็นจำนวนห้อง (ไม่ใช่เดือนปฏิทิน) เพราะแต่ละห้องครบชำระคนละวันกัน
+// แนบปุ่มติ๊ก "ชำระแล้ว" ต่อห้อง (ดูตอนรับ postback "mark_paid") ไว้เผื่อเจ้าของ/ผู้ดูแลรู้ว่าห้องนั้นจ่ายแล้วจริง (เช่น จ่ายผ่านช่องทางอื่น หรือลืมส่งสลิปเข้าบอท) จะได้ไม่โดนทวงซ้ำวันถัดไป
+async function pushOverdueChecklist(to, overdueRooms, totalRooms) {
+  const lines = overdueRooms.map(a => `• ${a.name} — ${a.tenant || 'ไม่ระบุผู้เช่า'} (฿${a.rent.toLocaleString()}, ครบกำหนดวันที่ ${a.dueDay})${a.skipReminder ? ' [ใช้บอทขุนทองอยู่แล้ว]' : ''}`);
+  const text = `📋 สรุปค้างชำระวันนี้: ${overdueRooms.length} จาก ${totalRooms} ห้อง\n━━━━━━━━━━━━━━\n${lines.join('\n')}\n\nกดติ๊กห้องที่ชำระแล้วได้เลยครับ เผื่อจ่ายผ่านช่องทางอื่นหรือลืมส่งสลิป`;
+  // LINE quick reply จำกัด 13 ปุ่ม — ถ้าค้างเกิน 13 ห้องพร้อมกัน ห้องที่เหลือจะไม่มีปุ่มติ๊กในรอบนี้ (ยังเห็นชื่อในลิสต์ข้อความปกติ)
+  const items = overdueRooms.slice(0, 13).map(a => ({
+    type: 'action',
+    action: {
+      type: 'postback',
+      label: `✅ ${a.name}`.slice(0, 20),
+      data: `mark_paid|${a.contractPageId}|${encodeURIComponent(a.name)}`,
+      displayText: `ติ๊กว่าห้อง ${a.name} ชำระแล้ว`
+    }
+  }));
+  const messages = [{ type: 'text', text }];
+  if (items.length) messages[0].quickReply = { items };
+  await axios.post('https://api.line.me/v2/bot/message/push',
+    { to, messages },
     { headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' } }
   );
 }
