@@ -36,6 +36,15 @@ function normalizeSlipDate(dateStr) {
   return `${y}-${mo}-${d}`;
 }
 
+// เผื่อ Claude vision อ่าน "เดือน" บนสลิปผิด (เช่น 07 เพี้ยนเป็น 08) ทำให้ resolveCycleMonth คำนวณรอบเดือนผิดไปทั้งเดือนแบบไม่มีใครสังเกต
+// (เจอจริงกับห้อง 464/4 — ส่งสลิปเข้าบอทห่างจากเวลาโอนในสลิปแค่ 1 นาที แต่ AI อ่านวันที่ผิดไปเกือบเดือน) เทียบวันที่ในสลิปกับวันที่บอทได้รับรูปจริง ห่างกันเกิน 3 วันถือว่าน่าสงสัยพอจะเตือน
+function dateSanityWarning(recordDate) {
+  if (!recordDate) return null;
+  const receivedDate = new Date().toISOString().slice(0, 10);
+  const gapDays = Math.round(Math.abs(new Date(recordDate + 'T00:00:00Z') - new Date(receivedDate + 'T00:00:00Z')) / 86400000);
+  return gapDays > 3 ? { receivedDate, gapDays } : null;
+}
+
 // หา "รอบเดือน" ที่สลิปนี้ควรนับเข้า — เทียบระยะห่างจริง (วัน) จากวันโอนไปยังวันครบชำระของเดือนนี้ กับของเดือนหน้า แล้วเลือกอันที่ใกล้กว่า
 // (เดิมใช้แค่ "วันที่โอน (ตัวเลขวันในเดือน) > วันครบชำระ ก็ชิฟไปเดือนหน้าเลย" ซึ่งพังทันทีถ้าวันครบชำระอยู่ปลายเดือน เช่น 23 — โอนวันที่ 24 (ช้าไปแค่ 1 วันของเดือนนี้)
 // จะถูกเข้าใจผิดว่าจ่ายล่วงหน้าให้เดือนหน้า ทำให้ Income DB เดือนนี้ไม่เห็นรายการจ่าย และ cron ทวงซ้ำทั้งที่จ่ายแล้ว — ดูตัวอย่างเคสห้อง 464/8 ที่แก้บั๊กนี้)
@@ -543,6 +552,11 @@ async function handleEvent(event) {
     // ถ้า AI อ่านวันที่จากสลิปไม่ได้ ใช้วันที่ที่ระบบได้รับรูปแทน — กันไม่ให้ "รอบเดือน" หายไปเฉยๆ จนเช็คค่าเช่าค้างมองไม่เห็นการจ่ายเงินนี้ทั้งเดือน
     const recordDate = slip.date || new Date().toISOString().slice(0, 10);
     body.properties['วันที่'] = { date: { start: recordDate } };
+    const dateWarning = dateSanityWarning(recordDate);
+    if (dateWarning) {
+      body.properties['หมายเหตุ'].rich_text[0].text.content +=
+        ` | ⚠️ วันที่ในสลิปห่างจากวันที่ส่งเข้าบอท ${dateWarning.gapDays} วัน (ได้รับจริง ${dateWarning.receivedDate}) — ตรวจสอบรอบเดือนอีกครั้ง เผื่อ AI อ่านวันที่ผิด`;
+    }
 
     // ค่าเช่าจ่ายล่วงหน้าเสมอ (จ่ายก่อนเข้าอยู่เดือนถัดไป ไม่ใช่จ่ายย้อนหลังของเดือนที่อยู่แล้ว) — เลือกรอบเดือนที่ "วันครบชำระ" ใกล้วันที่โอนที่สุด (ดู resolveCycleMonth)
     // เช่น ห้องครบชำระทุกวันที่ 1 โอนวันที่ 31 ก.ค. คือค่าเช่าเดือนสิงหาคม (ใกล้วันครบชำระ 1 ส.ค. กว่า) ไม่ใช่กรกฎาคม
@@ -581,6 +595,9 @@ async function handleEvent(event) {
 
     const amt = slip.amount ? `฿${slip.amount.toLocaleString()}` : '?';
     let msg = `✅ รับสลิปแล้วครับ\n━━━━━━━━━━━━━━\n💰 ยอด: ${amt}\n👤 ผู้โอน: ${slip.sender_name||'ไม่ระบุ'}\n📅 วันที่: ${slip.date||'ไม่ระบุ'}\n🔖 อ้างอิง: ${slip.ref_number||'ไม่ระบุ'}\n`;
+    if (dateWarning) {
+      msg += `\n⚠️ วันที่บนสลิปห่างจากตอนที่ส่งรูปเข้ามาจริง ${dateWarning.gapDays} วัน — ถ้าไม่ได้ตั้งใจส่งสลิปเก่า ระบบอาจอ่านวันที่ผิด รบกวนเจ้าของห้องตรวจสอบรอบเดือนอีกทีครับ`;
+    }
 
     if (matched) {
       msg += `\n🏠 ห้อง: ${matched.name}\n📝 บันทึก Notion เรียบร้อยแล้วครับ`;
@@ -628,6 +645,7 @@ async function handleDeductionReceipt(doc, to) {
   const fixedDate  = normalizeSlipDate(doc.date);
   const recordDate = fixedDate || doc.date || new Date().toISOString().slice(0, 10);
   const monthKey   = recordDate.slice(0, 7);
+  const dateWarning = dateSanityWarning(recordDate);
   await ensureMonthOption(monthKey);
 
   const assets  = await fetchAssetsWithContracts();
@@ -648,7 +666,7 @@ async function handleDeductionReceipt(doc, to) {
       'สถานะ':             { select: { name: 'เสร็จสิ้น' } },
       'วันที่':            { date: { start: recordDate } },
       'รอบเดือน':          { select: { name: monthKey } },
-      'หมายเหตุ':          { rich_text: [{ text: { content: `${desc} — ผู้เช่าสำรองจ่ายเอง (หักจากค่าเช่า)` } }] },
+      'หมายเหตุ':          { rich_text: [{ text: { content: `${desc} — ผู้เช่าสำรองจ่ายเอง (หักจากค่าเช่า)${dateWarning ? ` | ⚠️ วันที่ในใบเสร็จห่างจากวันที่ส่งเข้าบอท ${dateWarning.gapDays} วัน (ได้รับจริง ${dateWarning.receivedDate}) — ตรวจสอบรอบเดือนอีกครั้ง เผื่อ AI อ่านวันที่ผิด` : ''}` } }] },
     }
   };
   if (matched) body.properties['ห้อง / ทรัพย์สิน'] = { rich_text: [{ text: { content: matched.name } }] };
@@ -659,6 +677,9 @@ async function handleDeductionReceipt(doc, to) {
 
   const amt = amount ? `฿${amount.toLocaleString()}` : '?';
   let msg = `🧾 รับใบเสร็จ${category}แล้วครับ\n━━━━━━━━━━━━━━\n💰 ยอด: ${amt}\n📝 รายการ: ${desc}\n📅 วันที่: ${recordDate}\n`;
+  if (dateWarning) {
+    msg += `\n⚠️ วันที่บนใบเสร็จห่างจากตอนที่ส่งรูปเข้ามาจริง ${dateWarning.gapDays} วัน — ถ้าไม่ได้ตั้งใจส่งของเก่า ระบบอาจอ่านวันที่ผิด รบกวนเจ้าของห้องตรวจสอบรอบเดือนอีกทีครับ`;
+  }
   if (matched) {
     msg += `\n🏠 ห้อง: ${matched.name}\n📝 บันทึกเป็นรายจ่าย${category}แล้วครับ — ถ้ายอดค่าเช่าที่โอนมา + รายการนี้รวมกันครบค่าเช่าเต็ม จะถือว่าเดือนนี้จ่ายครบแล้ว`;
     await push(to, msg);
