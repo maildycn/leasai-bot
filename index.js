@@ -45,6 +45,24 @@ function dateSanityWarning(recordDate) {
   return gapDays > 3 ? { receivedDate, gapDays } : null;
 }
 
+// เช็คว่ารอบเดือนที่คำนวณจากวันที่บนสลิป มีรายการค่าเช่า "เสร็จสิ้น" ของห้องนี้อยู่แล้วหรือยัง
+// ใช้คู่กับ dateSanityWarning: ถ้าวันที่ห่างจากวันรับจริงเกิน 3 วัน "และ" รอบที่ได้ตกในเดือนที่จ่ายไปแล้ว
+// แปลว่า AI น่าจะอ่านวันที่ผิดไปตกเดือนเก่า ไม่ใช่แค่ผู้เช่าส่งสลิปเก่าเฉยๆ (เจอจริงกับห้อง 800/252 — อ่าน 3 ก.ย. เป็น 3 ก.ค. ทั้งที่ ก.ค. จ่ายไปแล้วตั้งแต่เดือนแรก)
+async function cycleAlreadyPaid(roomName, cycleMonth) {
+  const res = await axios.post(
+    `https://api.notion.com/v1/databases/${NOTION_INCOME_DB}/query`,
+    { page_size: 1, filter: { and: [
+      { property: 'ห้อง / ทรัพย์สิน', rich_text: { equals: roomName } },
+      { property: 'รอบเดือน', select: { equals: cycleMonth } },
+      { property: 'หมวดหมู่', select: { equals: 'ค่าเช่า' } },
+      { property: 'ประเภท', select: { equals: 'รายรับ' } },
+      { property: 'สถานะ', select: { equals: 'เสร็จสิ้น' } },
+    ] } },
+    { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
+  );
+  return res.data.results.length > 0;
+}
+
 // หา "รอบเดือน" ที่สลิปนี้ควรนับเข้า — เทียบระยะห่างจริง (วัน) จากวันโอนไปยังวันครบชำระของเดือนนี้ กับของเดือนหน้า แล้วเลือกอันที่ใกล้กว่า
 // (เดิมใช้แค่ "วันที่โอน (ตัวเลขวันในเดือน) > วันครบชำระ ก็ชิฟไปเดือนหน้าเลย" ซึ่งพังทันทีถ้าวันครบชำระอยู่ปลายเดือน เช่น 23 — โอนวันที่ 24 (ช้าไปแค่ 1 วันของเดือนนี้)
 // จะถูกเข้าใจผิดว่าจ่ายล่วงหน้าให้เดือนหน้า ทำให้ Income DB เดือนนี้ไม่เห็นรายการจ่าย และ cron ทวงซ้ำทั้งที่จ่ายแล้ว — ดูตัวอย่างเคสห้อง 464/8 ที่แก้บั๊กนี้)
@@ -427,6 +445,42 @@ async function handleEvent(event) {
         await push(to, `❌ บันทึกไม่สำเร็จ: ${err.message}`).catch(()=>{});
       }
     }
+
+    // เจ้าของห้องกดยืนยันว่า AI อ่านวันที่บนสลิปผิดจริง (ดูตอนส่ง pushDateFixConfirm) — แก้วันที่/รอบเดือน/ชื่อรายการให้ตรงรอบที่ถูกต้องในคลิกเดียว
+    if (data.startsWith('fix_slip_date|')) {
+      const [, pageId, newDate, newCycle] = data.split('|');
+      try {
+        const pageRes = await axios.get(`https://api.notion.com/v1/pages/${pageId}`,
+          { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28' } }
+        );
+        const cat      = pageRes.data.properties['หมวดหมู่']?.select?.name || 'ค่าเช่า';
+        const roomName = pageRes.data.properties['ห้อง / ทรัพย์สิน']?.rich_text?.[0]?.plain_text || '';
+        const oldNote  = pageRes.data.properties['หมายเหตุ']?.rich_text?.[0]?.plain_text || '';
+        await ensureMonthOption(newCycle);
+        await axios.patch(`https://api.notion.com/v1/pages/${pageId}`,
+          { properties: {
+              'วันที่':   { date: { start: newDate } },
+              'รอบเดือน': { select: { name: newCycle } },
+              'รายการ':   { title: [{ text: { content: `${cat} ${roomName} ${newCycle}`.trim() } }] },
+              'หมายเหตุ': { rich_text: [{ text: { content: `${oldNote} | แก้วันที่เป็น ${newDate} (รอบ ${newCycle}) — ยืนยันโดยเจ้าของห้องผ่านปุ่มกด` } }] },
+            } },
+          { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
+        );
+        if (roomName) {
+          const assets = await fetchAssetsWithContracts();
+          const room = assets.find(a => a.name === roomName);
+          if (room) await syncContractPaymentStatus(room.contractPageId, 'ชำระแล้ว');
+        }
+        await push(to, `✅ แก้เป็นรอบ ${newCycle} เรียบร้อยแล้วครับ`);
+      } catch (err) {
+        console.error('fix_slip_date ERR:', err.response?.data || err.message);
+        await push(to, `❌ แก้ไม่สำเร็จ: ${err.message}`).catch(()=>{});
+      }
+    }
+
+    if (data.startsWith('keep_slip_date|')) {
+      await push(to, `👍 รับทราบครับ ไม่แก้วันที่ให้`).catch(()=>{});
+    }
     return;
   }
 
@@ -570,6 +624,16 @@ async function handleEvent(event) {
     }
     if (slip.ref_number)  body.properties['เลขอ้างอิง'] = { rich_text: [{ text: { content: slip.ref_number } }] };
 
+    // ถ้าวันที่บนสลิปห่างจากวันรับจริงเกิน 3 วัน (dateWarning) และรอบเดือนที่ AI อ่านได้ตกในเดือนที่ห้องนี้จ่ายค่าเช่าไปแล้ว
+    // ให้เดารอบที่ "น่าจะถูกจริง" จากวันที่รับสลิปวันนี้แทน แล้วเสนอปุ่มแก้ให้กดยืนยันทีเดียว แทนที่จะฝังแค่ในหมายเหตุเฉยๆ (ดูตอนรับ postback "fix_slip_date")
+    let suspiciousFix = null;
+    if (matched && dateWarning) {
+      const todayCycle = resolveCycleMonth(dateWarning.receivedDate, matched.dueDay);
+      if (todayCycle !== cycleMonth && await cycleAlreadyPaid(matched.name, cycleMonth)) {
+        suspiciousFix = { correctDate: dateWarning.receivedDate, correctCycle: todayCycle, wrongCycle: cycleMonth };
+      }
+    }
+
     // กันซ้ำอีกชั้น เผื่อ AI อ่านเลขอ้างอิงจากสลิปใบเดียวกันเพี้ยนไปคนละตัวระหว่างสองครั้ง (เจอจริงกับห้อง 464/8 — เลขอ้างอิงต่างกันแค่ 1 หลัก)
     // ทำให้ตัวกันซ้ำด้วยเลขอ้างอิงตรงเป๊ะด้านบนจับไม่ได้ — เช็คซ้ำด้วย ห้อง+ยอด+วันที่+รอบเดือน แทน ถ้าเจอรายการเดิมอยู่แล้วไม่สร้างซ้อน
     if (matched) {
@@ -615,6 +679,8 @@ async function handleEvent(event) {
       msg += `\n❓ ไม่พบห้องที่ตรงกับยอดชัดเจน กดยืนยันห้องด้านล่างนี้ได้เลยครับ\n📝 บันทึกไว้ชั่วคราวแล้ว`;
       await pushRoomConfirm(to, msg, createRes.data.id, candidates, 'rent');
     }
+
+    if (suspiciousFix) await pushDateFixConfirm(to, matched.name, createRes.data.id, suspiciousFix);
 
   } catch (err) {
     console.error('ERR:', err.response?.status, JSON.stringify(err.response?.data), err.message);
@@ -714,6 +780,19 @@ async function pushShortfallConfirm(to, text, roomName, monthKey) {
   const items = [
     { type: 'action', action: { type: 'postback', label: 'ค่าซ่อม', data: `deduct_shortfall|ซ่อมแซม|${encodeURIComponent(roomName)}|${monthKey}`, displayText: 'ขาดเพราะหักค่าซ่อม' } },
     { type: 'action', action: { type: 'postback', label: 'ค่าน้ำ-ไฟ', data: `deduct_shortfall|ค่าน้ำ-ไฟ|${encodeURIComponent(roomName)}|${monthKey}`, displayText: 'ขาดเพราะหักค่าน้ำ-ไฟ' } },
+  ];
+  await axios.post('https://api.line.me/v2/bot/message/push',
+    { to, messages: [{ type: 'text', text, quickReply: { items } }] },
+    { headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' } }
+  );
+}
+
+// สงสัยว่า AI อ่านวันที่บนสลิปผิดไปตกเดือนที่จ่ายไปแล้ว (ดู cycleAlreadyPaid ด้านบน) — เสนอปุ่มแก้วันที่+รอบเดือนเป็นวันนี้ในคลิกเดียว (ดูตอนรับ postback "fix_slip_date")
+async function pushDateFixConfirm(to, roomName, pageId, fix) {
+  const text = `🤔 สังเกตว่ารอบเดือน ${fix.wrongCycle} ของห้อง ${roomName} มีรายการค่าเช่า "เสร็จสิ้น" อยู่แล้ว — สลิปที่เพิ่งส่งมาอาจจริงๆ เป็นของวันนี้ (รอบ ${fix.correctCycle}) แต่ AI อ่านวันที่บนสลิปผิดไปเป็นรอบ ${fix.wrongCycle} กดยืนยันด้านล่างได้เลยครับถ้าใช่`;
+  const items = [
+    { type: 'action', action: { type: 'postback', label: `ใช่ แก้เป็นรอบ ${fix.correctCycle}`, data: `fix_slip_date|${pageId}|${fix.correctDate}|${fix.correctCycle}`, displayText: `แก้เป็นรอบ ${fix.correctCycle}` } },
+    { type: 'action', action: { type: 'postback', label: 'ไม่ใช่ วันที่ถูกแล้ว', data: `keep_slip_date|${pageId}`, displayText: 'วันที่บนสลิปถูกต้องแล้ว' } },
   ];
   await axios.post('https://api.line.me/v2/bot/message/push',
     { to, messages: [{ type: 'text', text, quickReply: { items } }] },
