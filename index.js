@@ -802,12 +802,30 @@ async function pushDateFixConfirm(to, roomName, pageId, fix) {
 
 // สรุปห้องค้างชำระทั้งหมดส่งเข้ากลุ่มหลัก นับเป็นจำนวนห้อง (ไม่ใช่เดือนปฏิทิน) เพราะแต่ละห้องครบชำระคนละวันกัน
 // แนบปุ่มติ๊ก "ชำระแล้ว" ต่อห้อง (ดูตอนรับ postback "mark_paid") ไว้เผื่อเจ้าของ/ผู้ดูแลรู้ว่าห้องนั้นจ่ายแล้วจริง (เช่น จ่ายผ่านช่องทางอื่น หรือลืมส่งสลิปเข้าบอท) จะได้ไม่โดนทวงซ้ำวันถัดไป
+// ใช้ Flex Message แทน quick reply เดิม เพราะ quick reply ติดอยู่กับ "ข้อความล่าสุด" เท่านั้น — พอกดปุ่มติ๊กห้องแรก
+// ข้อความใหม่ (displayText) จะแทรกเข้ามาเป็นข้อความล่าสุดแทน ทำให้แถบปุ่มทั้งหมดหายไปทันที ติ๊กห้องอื่นในสรุปเดิมไม่ได้อีก
+// ปุ่มใน Flex (footer) ค้างอยู่กับบับเบิลถาวรไม่หายหลังกดครั้งเดียว และไม่ติดลิมิต 13 ปุ่มของ quick reply ด้วย
 async function pushOverdueChecklist(to, overdueRooms, totalRooms) {
-  const lines = overdueRooms.map(a => `• ${a.name} — ${a.tenant || 'ไม่ระบุผู้เช่า'} (฿${a.rent.toLocaleString()}, ครบกำหนดวันที่ ${a.dueDay})${a.skipReminder ? ' [ใช้บอทขุนทองอยู่แล้ว]' : ''}`);
-  const text = `📋 สรุปค้างชำระวันนี้: ${overdueRooms.length} จาก ${totalRooms} ห้อง\n━━━━━━━━━━━━━━\n${lines.join('\n')}\n\nกดติ๊กห้องที่ชำระแล้วได้เลยครับ เผื่อจ่ายผ่านช่องทางอื่นหรือลืมส่งสลิป`;
-  // LINE quick reply จำกัด 13 ปุ่ม — ถ้าค้างเกิน 13 ห้องพร้อมกัน ห้องที่เหลือจะไม่มีปุ่มติ๊กในรอบนี้ (ยังเห็นชื่อในลิสต์ข้อความปกติ)
-  const items = overdueRooms.slice(0, 13).map(a => ({
-    type: 'action',
+  const bodyContents = overdueRooms.map(a => ({
+    type: 'box',
+    layout: 'vertical',
+    margin: 'md',
+    contents: [
+      { type: 'text', text: a.name, weight: 'bold', size: 'sm', wrap: true },
+      {
+        type: 'text',
+        text: `${a.tenant || 'ไม่ระบุผู้เช่า'} · ฿${a.rent.toLocaleString()} · ครบกำหนดวันที่ ${a.dueDay}${a.skipReminder ? ' · ใช้บอทขุนทองอยู่แล้ว' : ''}`,
+        size: 'xs',
+        color: '#888888',
+        wrap: true
+      }
+    ]
+  }));
+
+  const footerButtons = overdueRooms.map(a => ({
+    type: 'button',
+    style: 'secondary',
+    height: 'sm',
     action: {
       type: 'postback',
       label: `✅ ${a.name}`.slice(0, 20),
@@ -815,10 +833,33 @@ async function pushOverdueChecklist(to, overdueRooms, totalRooms) {
       displayText: `ติ๊กว่าห้อง ${a.name} ชำระแล้ว`
     }
   }));
-  const messages = [{ type: 'text', text }];
-  if (items.length) messages[0].quickReply = { items };
+
+  const bubble = {
+    type: 'bubble',
+    header: {
+      type: 'box',
+      layout: 'vertical',
+      contents: [
+        { type: 'text', text: '📋 สรุปค้างชำระวันนี้', weight: 'bold', size: 'md' },
+        { type: 'text', text: `${overdueRooms.length} จาก ${totalRooms} ห้อง`, size: 'sm', color: '#888888' }
+      ]
+    },
+    body: { type: 'box', layout: 'vertical', spacing: 'sm', contents: bodyContents },
+    footer: {
+      type: 'box',
+      layout: 'vertical',
+      spacing: 'sm',
+      contents: [
+        { type: 'text', text: 'กดติ๊กห้องที่ชำระแล้วได้เลยครับ เผื่อจ่ายผ่านช่องทางอื่นหรือลืมส่งสลิป (ติ๊กได้หลายห้อง ปุ่มไม่หายหลังกด)', size: 'xs', color: '#888888', wrap: true, margin: 'md' },
+        ...footerButtons
+      ]
+    }
+  };
+
+  const altText = `สรุปค้างชำระวันนี้: ${overdueRooms.length} จาก ${totalRooms} ห้อง`;
+
   await axios.post('https://api.line.me/v2/bot/message/push',
-    { to, messages },
+    { to, messages: [{ type: 'flex', altText, contents: bubble }] },
     { headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' } }
   );
 }
