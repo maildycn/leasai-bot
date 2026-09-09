@@ -499,16 +499,14 @@ async function handleEvent(event) {
     const b64  = Buffer.from(imgRes.data).toString('base64');
     const mime = (imgRes.headers['content-type'] || 'image/jpeg').split(';')[0];
 
-    const aiRes = await axios.post(
-      'https://api.anthropic.com/v1/messages',
-      {
-        model: 'claude-sonnet-4-5',
-        max_tokens: 800,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'image', source: { type: 'base64', media_type: mime, data: b64 } },
-            { type: 'text', text: `อ่านภาพนี้ให้ละเอียดที่สุด ภาพอาจเป็น (1) สลิปโอนเงินธนาคารไทยที่ผู้เช่าโอนค่าเช่า หรือ (2) ใบเสร็จ/บิล/ใบแจ้งหนี้ที่ผู้เช่าสำรองจ่ายเองแล้วจะหักออกจากค่าเช่า (ค่าซ่อมแซม-ซ่อมบำรุง หรือค่าน้ำ-ไฟ) แล้วตอบ JSON เท่านั้น ห้ามมี markdown:
+    const slipAiBody = {
+      model: 'claude-sonnet-4-5',
+      max_tokens: 1500,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: mime, data: b64 } },
+          { type: 'text', text: `อ่านภาพนี้ให้ละเอียดที่สุด ภาพอาจเป็น (1) สลิปโอนเงินธนาคารไทยที่ผู้เช่าโอนค่าเช่า หรือ (2) ใบเสร็จ/บิล/ใบแจ้งหนี้ที่ผู้เช่าสำรองจ่ายเองแล้วจะหักออกจากค่าเช่า (ค่าซ่อมแซม-ซ่อมบำรุง หรือค่าน้ำ-ไฟ) แล้วตอบ JSON เท่านั้น ห้ามมี markdown:
 {"doc_type":"rent_slip"_or_"deduction_receipt"_or_"other","sender_name":string_or_null,"amount":number_or_null,"date":"YYYY-MM-DD"_or_null,"time":string_or_null,"ref_number":string_or_null,"bank_from":string_or_null,"bank_to":string_or_null,"memo":string_or_null,"deduction_category":"ซ่อมแซม"_or_"ค่าน้ำ-ไฟ"_or_null,"deduction_description":string_or_null}
 
 กติกาสำคัญ:
@@ -518,14 +516,29 @@ async function handleEvent(event) {
 4. memo (เฉพาะตอน doc_type เป็น rent_slip) คือข้อความบันทึกช่วยจำ/หมายเหตุที่ผู้โอนพิมพ์เอง (ถ้ามี) เช่น "ค่าเช่าห้อง 841" หรือชื่อห้อง/เลขห้อง — อ่านให้ครบทุกตัวอักษรที่เห็น ถ้าไม่มีข้อความแบบนี้ให้ตอบ null
 5. วันที่บนสลิป/ใบเสร็จไทยเป็นรูปแบบ วัน/เดือน/ปี (DD/MM/YYYY) เสมอ ห้ามอ่านสลับเป็นเดือน/วัน (MM/DD) แบบสากลอเมริกันเด็ดขาด เช่น 01/07/2569 หมายถึงวันที่ 1 เดือนกรกฎาคม ไม่ใช่วันที่ 1 เดือนมกราคม
 6. ฟิลด์ date ต้องเป็นปีคริสต์ศักราช (ค.ศ.) เสมอ ถ้าวันที่ในภาพแสดงเป็นปีพุทธศักราช (พ.ศ., ปกติจะเป็นเลข 25xx เช่น 2569) ให้แปลงเป็น ค.ศ. โดยลบ 543 ก่อนตอบ (เช่น พ.ศ. 2569 → ค.ศ. 2026) ห้ามตอบเลขปีพ.ศ.ตรงๆ โดยเด็ดขาด` }
-          ]
-        }]
-      },
-      { headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' } }
-    );
+        ]
+      }]
+    };
 
-    const raw = aiRes.data.content[0].text.trim().replace(/```json|```/g, '').trim();
-    const doc = JSON.parse(raw);
+    // สลิปบางใบอ่านยาก (เบลอ/แอปธนาคารแปลกๆ) ทำให้ AI ตอบมาไม่ใช่ JSON ล้วนๆ ตามสั่ง หรือคำตอบยาวจนโดนตัดกลางคันด้วย max_tokens เดิมที่ต่ำไป
+    // เดิม JSON.parse ตรงๆ พังแล้วโชว์ error ที่ผู้เช่าไม่รู้ว่าต้องทำไง เลยส่งซ้ำไปเรื่อยๆ จนสุ่มได้คำตอบที่ parse ผ่าน —
+    // ดึงเฉพาะช่วง {...} ก่อน parse (ทนต่อข้อความแทรก) + ลองใหม่อัตโนมัติ 1 ครั้งก่อนจะยอมแพ้จริงๆ
+    let doc, lastErr;
+    for (let attempt = 1; attempt <= 2 && !doc; attempt++) {
+      const aiRes = await axios.post('https://api.anthropic.com/v1/messages', slipAiBody,
+        { headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' } }
+      );
+      const raw = aiRes.data.content[0].text.trim();
+      const bStart = raw.indexOf('{'), bEnd = raw.lastIndexOf('}');
+      if (bStart !== -1 && bEnd > bStart) {
+        try { doc = JSON.parse(raw.slice(bStart, bEnd + 1)); }
+        catch (e) { lastErr = e; console.error(`Slip AI JSON parse failed (attempt ${attempt}):`, raw); }
+      } else {
+        lastErr = new Error('no JSON braces in AI response');
+        console.error(`Slip AI: no JSON braces (attempt ${attempt}):`, raw);
+      }
+    }
+    if (!doc) throw new Error('AI อ่านสลิปไม่สำเร็จ (รูปแบบคำตอบผิดพลาด): ' + (lastErr?.message || ''));
     console.log('Doc:', doc);
 
     if (doc.doc_type === 'deduction_receipt') { await handleDeductionReceipt(doc, to); return; }
