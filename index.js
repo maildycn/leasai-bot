@@ -755,11 +755,14 @@ async function handleDeductionReceipt(doc, to) {
   }
 }
 
-// ส่งข้อความพร้อมปุ่ม quick reply ให้กดยืนยันห้อง — แต่ละปุ่มเป็น postback คู่กับ pageId ของรายการที่สร้างไว้แล้ว
+// ส่งข้อความพร้อมปุ่มยืนยันห้อง — แต่ละปุ่มเป็น postback คู่กับ pageId ของรายการที่สร้างไว้แล้ว
 // เพื่อให้กดแล้วไปแก้ property ห้องของรายการเดิม ไม่ใช่สร้างรายการใหม่ซ้อน
+// ใช้ Flex Message (ปุ่มค้างอยู่ถาวรกับบับเบิล) แทน quick reply เดิม — quick reply ติดอยู่กับข้อความล่าสุดเท่านั้น
+// ถ้าไม่มีใครกดทันทีแล้วมีข้อความอื่นแทรกเข้ามาก่อน ปุ่มจะหายไปถาวร กดยืนยันห้องไม่ได้อีกเลย เจอจริง — รายรับหลายรายการค้างเป็น
+// "โอนเงิน X" ไม่มีห้องผูกอยู่ตลอดไป เพราะปุ่มยืนยันหายไปก่อนมีคนกด (เหมือนปัญหาเดิมที่เจอกับ pushOverdueChecklist)
 async function pushRoomConfirm(to, text, pageId, candidates, kind) {
-  const items = candidates.slice(0, 13).map(a => ({
-    type: 'action',
+  const buttons = candidates.slice(0, 13).map(a => ({
+    type: 'button', style: 'secondary', height: 'sm',
     action: {
       type: 'postback',
       label: a.name.slice(0, 20),
@@ -767,10 +770,17 @@ async function pushRoomConfirm(to, text, pageId, candidates, kind) {
       displayText: `ยืนยันห้อง ${a.name}`
     }
   }));
-  const messages = [{ type: 'text', text }];
-  if (items.length) messages[0].quickReply = { items };
+  if (!buttons.length) {
+    await push(to, text);
+    return;
+  }
+  const bubble = {
+    type: 'bubble',
+    body: { type: 'box', layout: 'vertical', contents: [{ type: 'text', text, wrap: true, size: 'sm' }] },
+    footer: { type: 'box', layout: 'vertical', spacing: 'sm', contents: buttons },
+  };
   await axios.post('https://api.line.me/v2/bot/message/push',
-    { to, messages },
+    { to, messages: [{ type: 'flex', altText: text.slice(0, 100), contents: bubble }] },
     { headers: { Authorization: `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' } }
   );
 }
