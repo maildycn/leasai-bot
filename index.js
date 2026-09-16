@@ -422,6 +422,16 @@ async function handleEvent(event) {
 
         const todayStr = new Date().toISOString().slice(0, 10);
         const cycleMonth = resolveCycleMonth(todayStr, room.dueDay);
+
+        // กันซ้ำ: ถ้าสลิปเข้ามาบันทึกแล้วระหว่างที่การ์ดค้างชำระยังค้างอยู่ในแชท (เช่นเจ้าของกดปุ่มหลังบอทอ่านสลิปไปแล้ว)
+        // จะได้ไม่สร้างรายการรับซ้ำสอง — เจอเคสจริงกับ Belle Grand Rama9 2026-09 (บันทึกซ้ำ 19,000 บาท)
+        const { received, offset } = await getRoomMonthTotal(room.name, cycleMonth);
+        if (received + offset >= room.rent) {
+          await syncContractPaymentStatus(room.contractPageId, 'ชำระแล้ว');
+          await push(to, `✅ ห้อง ${room.name} มีรายการรับครบแล้วในระบบครับ ไม่ต้องเพิ่มรายการซ้ำนะครับ`);
+          return;
+        }
+
         await ensureMonthOption(cycleMonth);
         await axios.post('https://api.notion.com/v1/pages', {
           parent: { database_id: NOTION_INCOME_DB },
