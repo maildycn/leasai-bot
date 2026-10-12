@@ -127,6 +127,7 @@ async function fetchAssetsWithContracts() {
         dueDay: p.properties['วันครบชำระ']?.number || null,
         tenantGroupId: p.properties['LINE Group ID']?.rich_text?.[0]?.plain_text || '',
         skipReminder: p.properties['ใช้บอทขุนทองอยู่แล้ว']?.checkbox === true,
+        startDate: p.properties['วันเริ่มสัญญา']?.date?.start || null,
       }))
       .filter(c => c.room && c.rent && c.status !== 'ยกเลิก' && c.status !== 'หมดอายุแล้ว');
   }
@@ -142,6 +143,7 @@ async function fetchAssetsWithContracts() {
       tenantGroupId: c ? c.tenantGroupId : '',
       skipReminder: c ? c.skipReminder : false,
       contractPageId: c ? c.id : null,
+      startDate: c ? c.startDate : null,
     };
   }).filter(a => a.rent > 0);
 }
@@ -178,6 +180,7 @@ async function getRoomMonthTotal(roomName, monthKey) {
         filter: { and: [
           { property: 'รอบเดือน', select: { equals: monthKey } },
           { property: 'ห้อง / ทรัพย์สิน', rich_text: { equals: roomName } },
+          { property: 'สถานะ', select: { does_not_equal: 'ยกเลิก' } },
         ] },
       },
       { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
@@ -188,13 +191,34 @@ async function getRoomMonthTotal(roomName, monthKey) {
 
   let received = 0, offset = 0;
   for (const p of results) {
-    const amount   = p.properties['จำนวนเงิน (บาท)']?.number || 0;
-    const type     = p.properties['ประเภท']?.select?.name;
-    const category = p.properties['หมวดหมู่']?.select?.name;
+    const amount    = p.properties['จำนวนเงิน (บาท)']?.number || 0;
+    const type      = p.properties['ประเภท']?.select?.name;
+    const category  = p.properties['หมวดหมู่']?.select?.name;
+    const deductRent = p.properties['หักจากค่าเช่า']?.checkbox === true;
     if (type === 'รายรับ' && category === 'ค่าเช่า') received += amount;
-    else if (type === 'รายจ่าย' && (category === 'ซ่อมแซม' || category === 'ค่าน้ำ-ไฟ')) offset += amount;
+    // ต้องติ๊ก "หักจากค่าเช่า" ด้วยเท่านั้น ไม่ใช่แค่หมวดตรง — ค่าซ่อม/ค่าน้ำ-ไฟที่เจ้าของจ่ายเองโดยตรง (ไม่เกี่ยวกับยอดที่ผู้เช่าโอนมา) ไม่ควรถูกเอาไปหักออกจากยอดค่าเช่าที่ต้องได้รับ
+    else if (type === 'รายจ่าย' && deductRent && (category === 'ซ่อมแซม' || category === 'ค่าน้ำ-ไฟ')) offset += amount;
   }
   return { received, offset };
+}
+
+// ไล่ถอยหลังทีละเดือนจากเดือนก่อนเดือนปัจจุบัน รวมยอดที่ขาดของแต่ละเดือนที่ยังไม่จ่ายครบ — ทวงแค่ค่าเช่าเดือนล่าสุดอย่างเดียวจะทำให้ยอดค้างจากเดือนก่อนๆหายไปเงียบๆถ้าห้องค้างติดกันหลายเดือน
+// หยุดทันทีที่เจอเดือนที่จ่ายครบแล้ว (ถือว่าก่อนหน้านั้นเคลียร์หมดแล้ว) หรือถอยเลยเดือนที่สัญญาเริ่ม (ถ้ามีข้อมูล) — จำกัดไว้ 24 เดือนเผื่อไม่มี startDate กันวนลูปยาวเกินไป
+async function computeArrears(room, currentMonthKey) {
+  let arrears = 0;
+  let [y, m] = currentMonthKey.split('-').map(Number);
+  const startMonthKey = room.startDate ? room.startDate.slice(0, 7) : null;
+  for (let i = 0; i < 24; i++) {
+    m -= 1;
+    if (m === 0) { m = 12; y -= 1; }
+    const key = `${y}-${String(m).padStart(2, '0')}`;
+    if (startMonthKey && key < startMonthKey) break;
+    const { received, offset } = await getRoomMonthTotal(room.name, key);
+    const shortfall = room.rent - received - offset;
+    if (shortfall <= 0) break;
+    arrears += shortfall;
+  }
+  return arrears;
 }
 
 // เช็คค่าเช่าค้างชำระวันนี้ แล้วส่งแจ้งเตือนเข้ากลุ่ม LINE — คืนค่าสรุปผลกลับไปด้วยเพื่อใช้ debug ผ่าน HTTP response โดยตรง ไม่ต้องพึ่ง server log
@@ -227,7 +251,10 @@ async function checkRentDue() {
     try {
       iRes = await axios.post(
         `https://api.notion.com/v1/databases/${NOTION_INCOME_DB}/query`,
-        { page_size: 100, start_cursor: startCursor, filter: { property: 'รอบเดือน', select: { equals: monthKey } } },
+        { page_size: 100, start_cursor: startCursor, filter: { and: [
+          { property: 'รอบเดือน', select: { equals: monthKey } },
+          { property: 'สถานะ', select: { does_not_equal: 'ยกเลิก' } },
+        ] } },
         { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
       );
     } catch (err) {
@@ -246,13 +273,15 @@ async function checkRentDue() {
   for (const p of incomeResults) {
     const roomKey = normRoomKey(p.properties['ห้อง / ทรัพย์สิน']?.rich_text?.[0]?.plain_text);
     if (!roomKey) continue;
-    const amount   = p.properties['จำนวนเงิน (บาท)']?.number || 0;
-    const type     = p.properties['ประเภท']?.select?.name;
-    const category = p.properties['หมวดหมู่']?.select?.name;
+    const amount    = p.properties['จำนวนเงิน (บาท)']?.number || 0;
+    const type      = p.properties['ประเภท']?.select?.name;
+    const category  = p.properties['หมวดหมู่']?.select?.name;
+    const deductRent = p.properties['หักจากค่าเช่า']?.checkbox === true;
     if (!roomTotals[roomKey]) roomTotals[roomKey] = { received: 0, repairOffset: 0 };
     if (type === 'รายรับ' && category === 'ค่าเช่า') roomTotals[roomKey].received += amount;
-    // ผู้เช่าสำรองจ่ายเองแล้วหักจากค่าเช่าได้ทั้งค่าซ่อมและค่าน้ำ-ไฟ (สองหมวดที่พบบ่อยสุด)
-    else if (type === 'รายจ่าย' && (category === 'ซ่อมแซม' || category === 'ค่าน้ำ-ไฟ')) roomTotals[roomKey].repairOffset += amount;
+    // ผู้เช่าสำรองจ่ายเองแล้วหักจากค่าเช่าได้ทั้งค่าซ่อมและค่าน้ำ-ไฟ (สองหมวดที่พบบ่อยสุด) — ต้องติ๊ก "หักจากค่าเช่า" ด้วย
+    // ไม่งั้นค่าซ่อม/ค่าน้ำ-ไฟที่เจ้าของจ่ายเองตรง (ไม่เกี่ยวกับยอดที่ผู้เช่าโอนมา) จะถูกเข้าใจผิดว่าผู้เช่าจ่ายไปแล้วส่วนหนึ่ง (เคสห้อง MyStory ติดตั้งแอร์ 2026-09-30)
+    else if (type === 'รายจ่าย' && deductRent && (category === 'ซ่อมแซม' || category === 'ค่าน้ำ-ไฟ')) roomTotals[roomKey].repairOffset += amount;
   }
   const isPaid = a => {
     const t = roomTotals[normRoomKey(a.name)];
@@ -272,11 +301,20 @@ async function checkRentDue() {
   summary.overdueRooms = allOverdue.map(a => a.name);
   if (!allOverdue.length) return summary;
 
+  // รวมยอดค้างสะสมจากเดือนก่อนเข้ากับยอดเดือนนี้ต่อห้อง ให้ทั้งข้อความทวงตรงและสรุปกลุ่มหลักเห็นยอดจริงที่ต้องได้รับ ไม่ใช่แค่ค่าเช่าเดือนล่าสุดเดือนเดียว
+  for (const a of allOverdue) {
+    const t = roomTotals[normRoomKey(a.name)];
+    const currentShortfall = Math.max(0, a.rent - ((t?.received || 0) + (t?.repairOffset || 0)));
+    a.arrears = await computeArrears(a, monthKey);
+    a.totalDue = currentShortfall + a.arrears;
+  }
+
   // ห้องที่มี LINE Group ID ของตัวเอง และไม่ได้ใช้บอทขุนทองอยู่แล้ว -> ทวงตรงเข้ากลุ่มผู้เช่าคนนั้นด้วย (นอกเหนือจากสรุปที่กลุ่มหลักด้านล่าง)
   const direct = allOverdue.filter(a => a.tenantGroupId && !a.skipReminder);
 
   for (const a of direct) {
-    const msg = `🔔 แจ้งเตือนค่าเช่าค้างชำระ\n━━━━━━━━━━━━━━\n🏠 ห้อง: ${a.name}\n💰 ค่าเช่า: ฿${a.rent.toLocaleString()}\n📅 ครบกำหนดชำระทุกวันที่ ${a.dueDay}\n\nรบกวนโอนค่าเช่าและส่งสลิปเข้ากลุ่มนี้ได้เลยครับ ขอบคุณครับ 🙏`;
+    const arrearsLine = a.arrears > 0 ? `\n⚠️ ยอดค้างจากเดือนก่อน: ฿${a.arrears.toLocaleString()}\n💵 ยอดรวมที่ต้องชำระ: ฿${a.totalDue.toLocaleString()}` : '';
+    const msg = `🔔 แจ้งเตือนค่าเช่าค้างชำระ\n━━━━━━━━━━━━━━\n🏠 ห้อง: ${a.name}\n💰 ค่าเช่า: ฿${a.rent.toLocaleString()}\n📅 ครบกำหนดชำระทุกวันที่ ${a.dueDay}${arrearsLine}\n\nรบกวนโอนค่าเช่าและส่งสลิปเข้ากลุ่มนี้ได้เลยครับ ขอบคุณครับ 🙏`;
     try {
       await axios.post('https://api.line.me/v2/bot/message/push',
         { to: a.tenantGroupId, messages: [{ type: 'text', text: msg }] },
@@ -397,6 +435,7 @@ async function handleEvent(event) {
             'สถานะ':             { select: { name: 'เสร็จสิ้น' } },
             'รอบเดือน':          { select: { name: monthKey } },
             'ห้อง / ทรัพย์สิน':  { rich_text: [{ text: { content: roomName } }] },
+            'หักจากค่าเช่า':     { checkbox: true },
             'หมายเหตุ':          { rich_text: [{ text: { content: `หักส่วนต่างค่าเช่าที่ขาดจากสลิป — ยืนยันเป็น${category}ผ่านปุ่มกด` } }] },
           }
         }, { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } });
@@ -755,6 +794,7 @@ async function handleDeductionReceipt(doc, to) {
       'สถานะ':             { select: { name: 'เสร็จสิ้น' } },
       'วันที่':            { date: { start: recordDate } },
       'รอบเดือน':          { select: { name: monthKey } },
+      'หักจากค่าเช่า':     { checkbox: true },
       'หมายเหตุ':          { rich_text: [{ text: { content: `${desc} — ผู้เช่าสำรองจ่ายเอง (หักจากค่าเช่า)${dateWarning ? ` | ⚠️ วันที่ในใบเสร็จห่างจากวันที่ส่งเข้าบอท ${dateWarning.gapDays} วัน (ได้รับจริง ${dateWarning.receivedDate}) — ตรวจสอบรอบเดือนอีกครั้ง เผื่อ AI อ่านวันที่ผิด` : ''}` } }] },
     }
   };
@@ -847,7 +887,7 @@ async function pushOverdueChecklist(to, overdueRooms, totalRooms) {
       { type: 'text', text: a.name, weight: 'bold', size: 'sm', wrap: true },
       {
         type: 'text',
-        text: `${a.tenant || 'ไม่ระบุผู้เช่า'} · ฿${a.rent.toLocaleString()} · ครบกำหนดวันที่ ${a.dueDay}${a.skipReminder ? ' · ใช้บอทขุนทองอยู่แล้ว' : ''}`,
+        text: `${a.tenant || 'ไม่ระบุผู้เช่า'} · ฿${a.rent.toLocaleString()}${a.arrears > 0 ? ` (ค้างเก่า ฿${a.arrears.toLocaleString()} รวม ฿${a.totalDue.toLocaleString()})` : ''} · ครบกำหนดวันที่ ${a.dueDay}${a.skipReminder ? ' · ใช้บอทขุนทองอยู่แล้ว' : ''}`,
         size: 'xs',
         color: '#888888',
         wrap: true
