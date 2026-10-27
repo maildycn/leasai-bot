@@ -1,0 +1,6 @@
+check-rent:
+  image: curlimages/curl:latest
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+  script:
+    - curl -sf "$CRON_URL"
