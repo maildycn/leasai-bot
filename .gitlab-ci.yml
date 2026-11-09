@@ -1,6 +1,13 @@
+keepalive:
+  image: curlimages/curl:latest
+  rules:
+    - if: '$SCHEDULE_TYPE == "keepalive"'
+  script:
+    - curl -sf https://leasai-bot-o9nc.onrender.com/
+
 check-rent:
   image: curlimages/curl:latest
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_TYPE != "keepalive"'
   script:
     - curl -sf "$CRON_URL"
