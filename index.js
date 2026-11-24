@@ -45,24 +45,6 @@ function dateSanityWarning(recordDate) {
   return gapDays > 3 ? { receivedDate, gapDays } : null;
 }
 
-// เช็คว่ารอบเดือนที่คำนวณจากวันที่บนสลิป มีรายการค่าเช่า "เสร็จสิ้น" ของห้องนี้อยู่แล้วหรือยัง
-// ใช้คู่กับ dateSanityWarning: ถ้าวันที่ห่างจากวันรับจริงเกิน 3 วัน "และ" รอบที่ได้ตกในเดือนที่จ่ายไปแล้ว
-// แปลว่า AI น่าจะอ่านวันที่ผิดไปตกเดือนเก่า ไม่ใช่แค่ผู้เช่าส่งสลิปเก่าเฉยๆ (เจอจริงกับห้อง 800/252 — อ่าน 3 ก.ย. เป็น 3 ก.ค. ทั้งที่ ก.ค. จ่ายไปแล้วตั้งแต่เดือนแรก)
-async function cycleAlreadyPaid(roomName, cycleMonth) {
-  const res = await axios.post(
-    `https://api.notion.com/v1/databases/${NOTION_INCOME_DB}/query`,
-    { page_size: 1, filter: { and: [
-      { property: 'ห้อง / ทรัพย์สิน', rich_text: { equals: roomName } },
-      { property: 'รอบเดือน', select: { equals: cycleMonth } },
-      { property: 'หมวดหมู่', select: { equals: 'ค่าเช่า' } },
-      { property: 'ประเภท', select: { equals: 'รายรับ' } },
-      { property: 'สถานะ', select: { equals: 'เสร็จสิ้น' } },
-    ] } },
-    { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' } }
-  );
-  return res.data.results.length > 0;
-}
-
 // หา "รอบเดือน" ที่สลิปนี้ควรนับเข้า — เทียบระยะห่างจริง (วัน) จากวันโอนไปยังวันครบชำระของเดือนนี้ กับของเดือนหน้า แล้วเลือกอันที่ใกล้กว่า
 // (เดิมใช้แค่ "วันที่โอน (ตัวเลขวันในเดือน) > วันครบชำระ ก็ชิฟไปเดือนหน้าเลย" ซึ่งพังทันทีถ้าวันครบชำระอยู่ปลายเดือน เช่น 23 — โอนวันที่ 24 (ช้าไปแค่ 1 วันของเดือนนี้)
 // จะถูกเข้าใจผิดว่าจ่ายล่วงหน้าให้เดือนหน้า ทำให้ Income DB เดือนนี้ไม่เห็นรายการจ่าย และ cron ทวงซ้ำทั้งที่จ่ายแล้ว — ดูตัวอย่างเคสห้อง 464/8 ที่แก้บั๊กนี้)
@@ -686,12 +668,13 @@ async function handleEvent(event) {
     }
     if (slip.ref_number)  body.properties['เลขอ้างอิง'] = { rich_text: [{ text: { content: slip.ref_number } }] };
 
-    // ถ้าวันที่บนสลิปห่างจากวันรับจริงเกิน 3 วัน (dateWarning) และรอบเดือนที่ AI อ่านได้ตกในเดือนที่ห้องนี้จ่ายค่าเช่าไปแล้ว
-    // ให้เดารอบที่ "น่าจะถูกจริง" จากวันที่รับสลิปวันนี้แทน แล้วเสนอปุ่มแก้ให้กดยืนยันทีเดียว แทนที่จะฝังแค่ในหมายเหตุเฉยๆ (ดูตอนรับ postback "fix_slip_date")
+    // ถ้าวันที่บนสลิปห่างจากวันรับจริงเกิน 3 วัน (dateWarning) และตกรอบเดือนคนละรอบกับวันนี้
+    // เสนอปุ่มแก้ให้กดยืนยันทีเดียวเสมอ แทนที่จะฝังแค่ในหมายเหตุ/ข้อความเฉยๆ แล้วไม่มีทางแก้ไขได้จริง (ดูตอนรับ postback "fix_slip_date")
+    // เดิมเช็ค cycleAlreadyPaid() ก่อนด้วย แต่แคบเกินไป — เคสจริงที่สลิปแค่ "ส่งช้า/บอทประมวลผลช้า" (ไม่มีรายการรอบก่อนชนอยู่) ก็ควรมีปุ่มให้แก้ด้วยเหมือนกัน
     let suspiciousFix = null;
     if (matched && dateWarning) {
       const todayCycle = resolveCycleMonth(dateWarning.receivedDate, matched.dueDay);
-      if (todayCycle !== cycleMonth && await cycleAlreadyPaid(matched.name, cycleMonth)) {
+      if (todayCycle !== cycleMonth) {
         suspiciousFix = { correctDate: dateWarning.receivedDate, correctCycle: todayCycle, wrongCycle: cycleMonth };
       }
     }
@@ -860,9 +843,10 @@ async function pushShortfallConfirm(to, text, roomName, monthKey) {
   );
 }
 
-// สงสัยว่า AI อ่านวันที่บนสลิปผิดไปตกเดือนที่จ่ายไปแล้ว (ดู cycleAlreadyPaid ด้านบน) — เสนอปุ่มแก้วันที่+รอบเดือนเป็นวันนี้ในคลิกเดียว (ดูตอนรับ postback "fix_slip_date")
+// วันที่บนสลิปห่างจากวันที่ส่งเข้าบอทเกิน 3 วัน ทำให้รอบเดือนที่ระบบจัดให้ (wrongCycle) คนละรอบกับวันนี้ (correctCycle)
+// อาจเป็นเพราะ AI อ่านวันที่ผิด หรือบอทประมวลผลสลิปช้า (ของจริงถูกส่งตรงเวลาแต่เพิ่งถูกอ่านวันนี้) — เสนอปุ่มแก้วันที่+รอบเดือนเป็นวันนี้ในคลิกเดียว (ดูตอนรับ postback "fix_slip_date")
 async function pushDateFixConfirm(to, roomName, pageId, fix) {
-  const text = `🤔 สังเกตว่ารอบเดือน ${fix.wrongCycle} ของห้อง ${roomName} มีรายการค่าเช่า "เสร็จสิ้น" อยู่แล้ว — สลิปที่เพิ่งส่งมาอาจจริงๆ เป็นของวันนี้ (รอบ ${fix.correctCycle}) แต่ AI อ่านวันที่บนสลิปผิดไปเป็นรอบ ${fix.wrongCycle} กดยืนยันด้านล่างได้เลยครับถ้าใช่`;
+  const text = `🤔 วันที่บนสลิปห่างจากวันที่ส่งเข้าบอทมาก ระบบเลยจัดให้เป็นรอบ ${fix.wrongCycle} — ถ้าจริงๆ เป็นรายการของตอนนี้ (รอบ ${fix.correctCycle}) เพราะ AI อ่านวันที่ผิด หรือสลิปถูกประมวลผลช้า กดยืนยันด้านล่างได้เลยครับถ้าใช่`;
   const items = [
     { type: 'action', action: { type: 'postback', label: `ใช่ แก้เป็นรอบ ${fix.correctCycle}`, data: `fix_slip_date|${pageId}|${fix.correctDate}|${fix.correctCycle}`, displayText: `แก้เป็นรอบ ${fix.correctCycle}` } },
     { type: 'action', action: { type: 'postback', label: 'ไม่ใช่ วันที่ถูกแล้ว', data: `keep_slip_date|${pageId}`, displayText: 'วันที่บนสลิปถูกต้องแล้ว' } },
